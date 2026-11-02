@@ -335,9 +335,14 @@ Dialogue: 0,0:00:00.00,${assTimestamp(end)},A,0,0,0,,${String(op.text).replace(/
 const path = require('path')
 const fs = require('fs')
 
-const SYSTEM_PROMPT = `You are the intent parser of "AI Clip Studio", a video editing assistant. Translate the user's request into a JSON list of ffmpeg operations.
+const SYSTEM_PROMPT = `You are the AI assistant of "AI Clip Studio", a video editing web app. The user's messages are free-form: accept ANY request they type, in their own words and any language — both edit commands and questions.
 Reply with ONLY JSON: {"ops":[...],"summary":"one friendly sentence"}.
-Allowed operation kinds and their fields:
+
+Two cases:
+1) The user asks for an edit → fill "ops" with a list of ffmpeg operations and make "summary" a short sentence describing what you did.
+2) The user asks anything that is NOT an edit (questions about the clip like "how long is it", advice like "what edits would suit a tiktok", greetings, chit-chat, follow-up questions, anything else) → reply with a single op: {"kind":"chat","reply":"..."} where "reply" is a helpful conversational answer that uses the video metadata (duration, dimensions, audio, fps), e.g. suggest fitting edits. Never hallucinate edits you cannot express with the ops below.
+
+Allowed edit operation kinds and their fields:
 {"kind":"trim","from":seconds|null,"to":seconds|null}
 {"kind":"speed","rate":number}
 {"kind":"mute"}
@@ -350,82 +355,178 @@ Allowed operation kinds and their fields:
 {"kind":"gif","fps":int,"width":int} {"kind":"reverse"} {"kind":"boomerang"}
 {"kind":"fps","value":int} {"kind":"gray"} {"kind":"sepia"}
 {"kind":"eq","brightness":-0.1..0.1|null,"saturation":0..2|null,"contrast":0.5..2|null}
-{"kind":"blur","radius":int}`
+{"kind":"blur","radius":int}
+For ANY other visual or audio effect express it with a generic filter op so arbitrary user requests still work:
+{"kind":"filter","vf":"<single ffmpeg video filter expression>","label":"short description"} — e.g. "eq=hue=0.2" for a hue shift, "vignette", "fade=t=in:st=0:d=1", "colorlevels=rimin=0.1", "curves=vintage", "chromashift", "tweak=hs=20", "hue=s=1.3", "crops" only via trim/aspect. The expression must be ONE filter or comma-joined filters, using only ffmpeg syntax (no quotes, no backslashes, no file paths).
+{"kind":"afilter","af":"<single ffmpeg audio filter expression>","label":"short description"} — e.g. "bass=g=8", "aecho=0.8:0.7:60:0.5", "highpass=f=200", "compand". Same syntax restrictions.
+Do not use file-based filters (drawtext with fontfile, subtitles, movie, amovie, opencl, overlay with images) — text overlays are handled by the built-in text op. Prefer the specific ops above when they fit; use filter/afilter only for effects they don't cover. You may chain multiple edits in one message.`
 
-async function understandWithLLM(message, meta, history) {
-  const openai = process.env.OPENAI_API_KEY
-  const anthropic = process.env.ANTHROPIC_API_KEY
-  if (!openai && !anthropic) return null
-  const videoInfo = `Video is ${meta.duration}s, ${meta.width}x${meta.height}, ${meta.hasAudio ? 'has audio' : 'no audio'}.`
-  try {
-    let raw = null
-    if (openai) {
+const FILTER_SAFE = /^[A-Za-z0-9 _=:/.,()+?*%!-]{0,500}$/
+const FILTER_BLOCKED = /\b(file|protocol|opencl|movie|amovie|subtitles|drawtext|overlay|lavfi|protected|stdin|stdout)\b/i
+
+function safeFilter(s) {
+  if (typeof s !== 'string') return null
+  s = s.trim()
+  if (!s || s.length > 500) return null
+  if (/[\\'"`$&|;<>{\r\n]/.test(s)) return null
+  if (FILTER_SAFE.test(s) === false || FILTER_BLOCKED.test(s)) return null
+  return s
+}
+
+const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur', 'filter', 'afilter', 'chat'])
+
+const PROVIDERS = [
+  {
+    name: 'gemini',
+    key: () => process.env.GEMINI_API_KEY,
+    model: () => process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    _raw: async function (system, msgs, model) {
+      const sys = { role: 'user', parts: [{ text: system }] }
+      const toParts = (m) => ({ role: m.role, parts: [{ text: m.content }] })
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.key())}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: sys,
+          contents: [...msgs.map(toParts), { parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] }],
+          generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+        }),
+      })
+      if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
+      const j = await r.json()
+      return j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || null
+    },
+    async call(system, msgs, model) {
+      let last
+      for (let i = 0; i < 3; i++) {
+        try { return await this._raw(system, msgs, model) } catch (e) {
+          if (!/http (429|5\d\d)/.test(e.message)) throw e
+          last = e
+          await new Promise((ok) => setTimeout(ok, 1500 * (i + 1)))
+        }
+      }
+      throw last
+    },
+  },
+  {
+    name: 'openai',
+    key: () => process.env.OPENAI_API_KEY,
+    model: () => process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    async call(system, msgs, model) {
       const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${openai}` },
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.key()}` },
         body: JSON.stringify({
-          model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+          model,
           response_format: { type: 'json_object' },
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT + ' ' + videoInfo },
-            ...history.slice(-8),
-            { role: 'user', content: message },
-          ],
+          messages: [{ role: 'system', content: system }, ...msgs, { role: 'user', content: 'Remember: answer ONLY with the JSON object.' }],
         }),
       })
+      if (!r.ok) throw new Error(`openai http ${r.status}`)
       const j = await r.json()
-      raw = j.choices?.[0]?.message?.content
-    } else {
+      return j.choices?.[0]?.message?.content || null
+    },
+  },
+  {
+    name: 'anthropic',
+    key: () => process.env.ANTHROPIC_API_KEY,
+    model: () => process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022',
+    async call(system, msgs, model) {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-api-key': anthropic, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({
-          model: process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022',
-          max_tokens: 1024,
-          system: SYSTEM_PROMPT + ' ' + videoInfo,
-          messages: [...history.slice(-8), { role: 'user', content: message }],
-        }),
+        headers: { 'content-type': 'application/json', 'x-api-key': this.key(), 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model, max_tokens: 2048, system, messages: msgs }),
       })
+      if (!r.ok) throw new Error(`anthropic http ${r.status}`)
       const j = await r.json()
-      raw = j.content?.[0]?.text
-    }
-    if (!raw) return null
-    const parsed = JSON.parse(raw.replace(/^```json?|```$/g, '').trim())
-    if (!Array.isArray(parsed.ops) || !parsed.ops.length) return null
-    const allowed = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur'])
-    const ops = parsed.ops.filter((o) => allowed.has(o.kind)).slice(0, 6)
-    if (!ops.length) return null
-    ops.forEach((o) => {
-      if (o.kind === 'rotate') {
-        o.vf = o.deg === 90 ? 'transpose=1' : o.deg === 270 ? 'transpose=2' : 'transpose=1,transpose=1'
-        o.label = `rotate ${o.deg}°`
-      } else if (o.kind === 'speed' && o.rate > 1) {
-        o.vf = `setpts=PTS/${o.rate}`
-        o.af = `atempo=${atempoChain(o.rate).join(',atempo=')}`
-        o.label = `${o.rate}× speed`
-      } else if (o.kind === 'scale' && o.height) {
-        o.vf = `scale=-2:${o.height}`
-        o.label = `scale to ${o.height}p`
-      } else if (o.kind === 'mute') { o.bareArgs = ['-an']; o.label = 'remove audio' }
-      else if (o.kind === 'mirror') o.label = 'mirror'
-      else if (o.kind === 'vflip') o.label = 'flip vertically'
-      else if (o.kind === 'gray') { o.vf = 'hue=s=0'; o.label = 'black & white' }
-      else if (o.kind === 'blur') { o.vf = `boxblur=${o.radius || 4}`; o.label = `blur ${o.radius || 4}` }
-      else if (o.kind === 'gif') { o.outKind = 'gif'; o.label = `GIF @ ${o.fps || 12}fps` }
-      else if (o.kind === 'audioOut') { o.outKind = 'mp3'; o.label = 'export audio mp3' }
-      else if (o.kind === 'eq') {
-        const parts = []
-        if (o.brightness) parts.push(`brightness=${o.brightness}`)
-        if (o.saturation) parts.push(`saturation=${o.saturation}`)
-        if (o.contrast) parts.push(`contrast=${o.contrast}`)
-        if (parts.length) { o.vf = `eq=${parts.join(':')}`; o.label = 'color grade' } else o.vf = null
-      }
-    })
-    return { ops, summary: parsed.summary || ops.map((o) => o.label).join(' + '), isLLM: true }
-  } catch (e) {
-    console.error('[ai] LLM failed → falling back to local engine:', e.message)
+      return j.content?.[0]?.text || null
+    },
+  },
+]
+
+function normalizeOps(parsed, mediaInfo) {
+  const ops = (parsed.ops || []).filter((o) => o && ALLOWED_KINDS.has(o.kind))
+  const chatOps = ops.filter((o) => o.kind === 'chat')
+  if (chatOps.length && !ops.some((o) => o.kind !== 'chat')) {
+    const reply = String(chatOps[0].reply || '').trim()
+    if (reply) return { isChat: true, reply }
     return null
   }
+  const usable = ops.filter((o) => o.kind !== 'chat').slice(0, 6)
+  if (!usable.length) return null
+  usable.forEach((o) => {
+    const label = o.label || o.kind
+    if (o.kind === 'rotate') {
+      o.vf = o.deg === 90 ? 'transpose=1' : o.deg === 270 ? 'transpose=2' : 'transpose=1,transpose=1'
+      o.label = `rotate ${o.deg}°`
+    } else if (o.kind === 'speed' && o.rate > 1) {
+      o.vf = `setpts=PTS/${o.rate}`
+      o.af = `atempo=${atempoChain(o.rate).join(',atempo=')}`
+      o.label = `${o.rate}× speed`
+    } else if (o.kind === 'speed' && o.rate && o.rate < 1) {
+      o.vf = `setpts=PTS/${o.rate}`
+      o.af = `atempo=${atempoChain(o.rate).join(',atempo=')}`
+      o.label = `${o.rate}× slow motion`
+    } else if (o.kind === 'scale' && o.height) {
+      o.vf = `scale=-2:${o.height}`
+      o.label = `scale to ${o.height}p`
+    } else if (o.kind === 'mute') { o.bareArgs = ['-an']; o.label = 'remove audio' }
+    else if (o.kind === 'mirror') o.label = 'mirror'
+    else if (o.kind === 'vflip') o.label = 'flip vertically'
+    else if (o.kind === 'gray') { o.vf = 'hue=s=0'; o.label = 'black & white' }
+    else if (o.kind === 'blur') { o.vf = `boxblur=${o.radius || 4}`; o.label = `blur ${o.radius || 4}` }
+    else if (o.kind === 'gif') { o.outKind = 'gif'; o.fps = o.fps || 12; o.width = o.width || 480; o.label = `GIF @ ${o.fps}fps` }
+    else if (o.kind === 'audioOut') { o.outKind = 'mp3'; o.label = 'export audio mp3' }
+    else if (o.kind === 'text') { o.pos = ['top', 'center', 'bottom'].includes(o.pos) ? o.pos : 'center'; o.text = String(o.text || '').slice(0, 120); o.size = Math.min(Math.max(12, +o.size || 40), 200); o.label = `text "${(o.text || '').slice(0, 30)}" (${o.pos})` }
+    else if (o.kind === 'trim') { o.from = o.from != null ? Math.max(0, +o.from || 0) : null; o.to = o.to != null && typeof mediaInfo.duration === 'number' ? Math.min(mediaInfo.duration, Math.max(0.1, +o.to || 0)) : (o.to != null ? Math.max(0.1, +o.to || 0) : null); o.label = o.label || `trim ${(o.from ?? 0)}s → ${o.to == null ? 'end' : o.to + 's'}` }
+    else if (o.kind === 'volume') { o.label = `volume ${o.factor > 1 ? 'up' : 'down'}`; if (o.factor) o.af = `volume=${o.factor}` }
+    else if (o.kind === 'fps') { o.label = `${o.value} fps`; if (o.value) o.vf = `fps=${o.value}` }
+    else if (o.kind === 'eq') {
+      const parts = []
+      if (o.brightness) parts.push(`brightness=${o.brightness}`)
+      if (o.saturation) parts.push(`saturation=${o.saturation}`)
+      if (o.contrast) parts.push(`contrast=${o.contrast}`)
+      if (parts.length) { o.vf = `eq=${parts.join(':')}`; o.label = o.label || 'color grade' } else { o.vf = null; o.kind = null }
+    } else if (o.kind === 'filter') {
+      const f = safeFilter(o.vf || o.value || o.filter)
+      if (f) { o.vf = f; o.kind = 'filter'; o.label = o.label || f.split('=')[0] } else o.kind = null
+    } else if (o.kind === 'afilter') {
+      const f = safeFilter(o.af || o.value || o.filter)
+      if (f) { o.af = f; o.kind = 'afilter'; o.label = o.label || f.split('=')[0] } else o.kind = null
+    }
+    if (o.kind === null) o._drop = true
+    if (o.kind && !o.label) o.label = label
+  })
+  const final = usable.filter((o) => !o._drop)
+  if (!final.length) return null
+  return { ops: final, summary: parsed.summary || final.map((o) => o.label).join(' + '), isLLM: true }
+}
+
+async function understandWithLLM(message, meta, history) {
+  const videoInfo = `Video is ${meta.duration}s, ${meta.width}x${meta.height}, ${meta.hasAudio ? 'has audio' : 'no audio'}, ${meta.fps || '?'}fps.`
+  const system = SYSTEM_PROMPT + ' ' + videoInfo
+  const msgs = [...history.slice(-8), { role: 'user', content: message }]
+  for (const p of PROVIDERS) {
+    if (!p.key()) continue
+    try {
+      const raw = await p.call(system, msgs, p.model())
+      if (!raw) continue
+      const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
+      const parsed = JSON.parse(cleaned)
+      const nx = normalizeOps(parsed, meta)
+      if (nx) {
+        if (nx.isChat) return { isChat: true, reply: nx.reply, isLLM: true, summary: '' }
+        return nx
+      }
+      // model answered JSON but no usable ops — treat summary as a chat reply
+      if (parsed && parsed.summary && !Array.isArray(parsed.ops)) {
+        return { isChat: true, reply: String(parsed.summary), isLLM: true, summary: '' }
+      }
+    } catch (e) {
+      console.error(`[ai] LLM provider "${p.name}" failed:`, e.message)
+    }
+  }
+  return null
 }
 
 module.exports = { understand, understandWithLLM, build, makeTextOverlay }

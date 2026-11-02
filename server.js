@@ -1,10 +1,24 @@
 // ---------------------------------------------------------------------------
 // server.js — AI Clip Studio: zero-dependency Node.js video-editing web app
 //   • upload a clip (any ffmpeg-readable format)
-//   • chat with the AI about the edits you want ("cut the first 3s, make it square")
-//   • the AI turns your words into an ffmpeg pipeline and renders it
+//   • chat with the AI about the edits you want — ANY free-form request
+//     ("cut the first 3s, make it square", "why not add a caption?") —
+//     the AI (Gemini/OpenAI/Anthropic via env keys, else local engine) turns
+//     your words into an ffmpeg pipeline and renders it, and answers
+//     non-edit questions conversationally.
 // Used ffmpeg binary: ./vendor/ffmpeg if present, else whatever is on PATH.
 // ---------------------------------------------------------------------------
+
+// --- load .env (key-value lines) — never committed --------------------------
+{
+  const envPath = __dirname + '/.env'
+  try {
+    for (const line of require('fs').readFileSync(envPath, 'utf8').split('\n')) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/)
+      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
+    }
+  } catch { /* no .env — fine */ }
+}
 
 const http = require('http')
 const fs = require('fs')
@@ -215,7 +229,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    if (p === '/api/health') return json(res, 200, { ok: true, ffmpeg: FFMPEG, aiKey: !!(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY) })
+    if (p === '/api/health') return json(res, 200, { ok: true, ffmpeg: FFMPEG, aiKey: !!(process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY) })
 
     // ---- upload ----
     if (p === '/api/upload' && req.method === 'POST') {
@@ -246,22 +260,11 @@ const server = http.createServer(async (req, res) => {
       const src = path.join(JOBS, id, job.versions[job.versions.length - 1])
       const meta = await probe(src)
 
-      // 1) understand the request (LLM if configured, else local engine)
-      let result = await understandWithLLM(message, meta, job.msgs.concat([{ role: 'user', content: message }]))
-      let unresolved = false
-      if (!result) {
-        result = understand(message, meta)
-        if (!result.ops.length) unresolved = true
-      }
-      if (unresolved) {
-        const reply = "I couldn't map that to an edit I know yet. Try things like: \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\", or ask \"what can you do?\""
-        job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
-        return json(res, 200, { reply, commands: [], media: null })
-      }
-
-      // capability tour
+      // capability tour — handled locally, no LLM round-trip needed
       if (/^(what can you|help|commands|abilities)/.test(message.toLowerCase().trim())) {
         const list = [
+          'Ask me *anything* in your own words — commands or questions, in any language. Examples:',
+          '',
           '✂️ Trim — “remove the first 3 seconds”, “keep only 0:05 to 0:10”',
           '⏩ Speed — “2x speed”, “slow motion”',
           '🔇 Audio — “mute it”, “make it louder 2x”, “give me just the audio”',
@@ -271,12 +274,34 @@ const server = http.createServer(async (req, res) => {
           '🎞 GIF — “make a gif at 15 fps”',
           '⏪ FX — “reverse”, “boomerang”, “blur”, “black and white”, “vintage”',
           '🎨 Color — “brighter”, “more colorful”, “more contrast”',
-          '🔊 Audio — “louder 2x”, “extract audio as mp3”',
+          '🧪 Anything else ffmpeg can do — “add a vignette”, “car radio style animation”, “fade in 1s”, “remove the bass”…',
           '',
           'You can chain edits in one message — e.g. “cut the first 3s, make it square, add text HI at the top”.',
+          'You can also just ask questions — “would this work as a TikTok?” and I’ll answer.',
           'Each reply shows the real ffmpeg command it ran.',
         ]
         const reply = 'Here\'s what I can do with your clip:\n' + list.join('\n')
+        job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+        return json(res, 200, { reply, commands: [], media: null })
+      }
+
+      // 1) understand the request (LLM if configured, else local engine)
+      let result = await understandWithLLM(message, meta, job.msgs.concat([{ role: 'user', content: message }]))
+
+      // LLM chose a conversational answer (question / advice / chit-chat)
+      if (result && result.isChat) {
+        const reply = result.reply
+        job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+        return json(res, 200, { reply, commands: [], media: null, engine: 'llm-chat' })
+      }
+
+      let unresolved = false
+      if (!result) {
+        result = understand(message, meta)
+        if (!result.ops.length) unresolved = true
+      }
+      if (unresolved) {
+        const reply = "I couldn't map that to an edit I know yet. Try rephrasing — e.g. \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\" — or ask \"what can you do?\""
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
       }
