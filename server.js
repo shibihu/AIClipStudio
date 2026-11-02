@@ -105,42 +105,109 @@ function readJson(req) {
   })
 }
 
-// minimal multipart/form-data parser (buffered; fine for ≤ ~1 GB local use)
-function parseMultipart(req, boundary) {
+// streaming multipart/form-data parser: file parts are piped straight to
+// destPath (memory stays flat for 1 GB uploads); fields are buffered (≤ 1 MB).
+// Only the FIRST file part is captured; later ones are skipped.
+function parseMultipart(req, boundary, destPath) {
   return new Promise((resolve, reject) => {
-    const chunks = []
-    let size = 0
-    req.on('data', (c) => {
-      chunks.push(c); size += c.length
-      if (size > MAX_UPLOAD) { reject(new Error('File too large (max 1 GB)')); req.destroy() }
-    })
-    req.on('end', () => {
-      const buf = Buffer.concat(chunks)
-      const delim = Buffer.from(`--${boundary}`)
-      const fields = {}
-      let file = null
-      let idx = buf.indexOf(delim)
-      while (idx !== -1) {
-        const next = buf.indexOf(delim, idx + delim.length)
-        if (next === -1) break
-        // part = everything between end of delimiter line and next delimiter
-        let start = buf.indexOf('\r\n', idx) + 2
-        const headEnd = buf.indexOf('\r\n\r\n', start)
-        if (headEnd === -1 || headEnd > next) { idx = next; continue }
-        const head = buf.slice(start, headEnd).toString('utf8')
-        const body = buf.slice(headEnd + 4, next - 2) // strip trailing \r\n
-        const nameM = head.match(/name="([^"]*)"/)
-        const fileM = head.match(/filename="([^"]*)"/)
-        const ctype = (head.match(/content-type:\s*([^\r\n]+)/i) || [])[1]
-        if (nameM) {
-          if (fileM && fileM[1]) file = { filename: fileM[1], mime: (ctype || 'application/octet-stream').trim(), data: body }
-          else fields[nameM[1]] = body.toString('utf8')
-        }
-        idx = next
+    const B = Buffer.from(`--${boundary}`)
+    const D = Buffer.from(`\r\n--${boundary}`)
+    let buf = Buffer.alloc(0)
+    let total = 0
+    let done = false, failed = false
+    let state = 'preamble' // preamble → delimEnd → headers ↔ body
+    let fields = {}
+    let curField = null
+    let fieldBytes = 0
+    let file = null
+    let ws = null
+
+    const fail = (e) => {
+      if (failed) return
+      failed = true
+      if (ws) { try { ws.destroy() } catch {} }
+      try { fs.unlinkSync(destPath) } catch {}
+      req.destroy()
+      reject(e)
+    }
+    const sink = (part) => {
+      if (ws) { ws.write(part); file.size += part.length }
+      else if (curField !== null) {
+        fieldBytes += part.length
+        if (fieldBytes > 1024 * 1024) return fail(new Error('form field too large'))
+        fields[curField] = (fields[curField] || '') + part.toString('utf8')
       }
-      resolve({ fields, file })
+    }
+
+    function pump() {
+      for (;;) {
+        if (state === 'preamble') {
+          const i = buf.indexOf(B)
+          if (i === -1) {
+            if (buf.length > B.length) buf = buf.slice(buf.length - B.length)
+            return
+          }
+          buf = buf.slice(i + B.length) // consume '--boundary'; '\r\n' or terminator follows
+          state = 'delimEnd'
+        } else if (state === 'delimEnd') {
+          if (buf.length < 2) return
+          if (buf[0] === 0x2d && buf[1] === 0x2d) { done = true; return }
+          if (buf[0] === 0x0d && buf[1] === 0x0a) { buf = buf.slice(2); state = 'headers' }
+          else return fail(new Error('malformed multipart body'))
+        } else if (state === 'headers') {
+          const he = buf.indexOf('\r\n\r\n')
+          if (he === -1) {
+            if (buf.length > 64 * 1024) return fail(new Error('multipart header too large'))
+            return
+          }
+          const head = buf.slice(0, he).toString('utf8')
+          buf = buf.slice(he + 4)
+          const nameM = head.match(/name="([^"]*)"/)
+          const fileM = head.match(/filename="([^"]*)"/)
+          const ctype = (head.match(/content-type:\s*([^\r\n]+)/i) || [])[1]
+          curField = null; ws = null
+          if (nameM) {
+            if (fileM && fileM[1]) {
+              if (!file) {
+                file = { filename: fileM[1], mime: (ctype || 'application/octet-stream').trim(), size: 0, path: destPath }
+                ws = fs.createWriteStream(destPath, { flags: 'w' })
+              } // else: skip extra file parts
+            } else { curField = nameM[1]; fields[curField] = '' }
+          }
+          fieldBytes = 0
+          state = 'body'
+        } else { // body
+          const k = buf.indexOf(D)
+          if (k === -1) {
+            const keep = Math.min(buf.length, D.length - 1) // hold back a partial delimiter
+            const cut = buf.length - keep
+            if (cut > 0) { sink(buf.slice(0, cut)); buf = buf.slice(cut) }
+            return
+          }
+          if (k > 0) sink(buf.slice(0, k))
+          buf = buf.slice(k + D.length)
+          curField = null; ws = null
+          state = 'delimEnd'
+        }
+      }
+    }
+
+    req.on('data', (c) => {
+      if (failed) return
+      total += c.length
+      if (total > MAX_UPLOAD) return fail(new Error('File too large (max 1 GB)'))
+      buf = buf.length ? Buffer.concat([buf, c]) : c
+      pump()
     })
-    req.on('error', reject)
+    req.on('error', (e) => fail(e))
+    req.on('aborted', () => fail(new Error('upload aborted')))
+    req.on('end', () => {
+      if (failed) return
+      if (!done) return fail(new Error('truncated multipart body'))
+      const finish = () => resolve({ fields, file })
+      if (ws) ws.end(finish)
+      else finish()
+    })
   })
 }
 
@@ -150,6 +217,8 @@ function extOf(filename, mime) {
   const map = { 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm' }
   return map[mime] || 'bin'
 }
+
+function fmtMB(n) { return n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB' }
 
 function ffprobeJson(file) {
   return new Promise((resolve) => {
@@ -191,6 +260,26 @@ function loadJob(id) {
 }
 const history = new Map() // id → { msgs, input, versions, next }
 
+// --- periodic cleanup: remove job dirs older than JOBS_TTL_HOURS (default 24) --
+const JOBS_TTL_MS = Math.max(0.01, +process.env.JOBS_TTL_HOURS || 24) * 3600 * 1000
+async function cleanupJobs() {
+  let names
+  try { names = await fsp.readdir(JOBS) } catch { return }
+  const cutoff = Date.now() - JOBS_TTL_MS
+  for (const name of names) {
+    if (/^_/.test(name)) continue // helpers like _sample.mp4 are kept
+    const dir = path.join(JOBS, name)
+    try {
+      const st = await fsp.stat(dir)
+      if (!st.isDirectory()) continue
+      if (st.mtimeMs < cutoff) {
+        await fsp.rm(dir, { recursive: true, force: true })
+        console.log(`[ai-studio] cleaned stale job ${name}`)
+      }
+    } catch { /* gone or unreadable */ }
+  }
+}
+
 // --- request router ------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
@@ -211,22 +300,45 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // media files
+    // media files (Range-aware so browsers can scrub/seek)
     const mediaM = p.match(/^\/media\/([a-f0-9-]+)\/([\w.-]+)$/)
     if (req.method === 'GET' && mediaM) {
       const abs = path.join(JOBS, mediaM[1], mediaM[2])
       if (!abs.startsWith(JOBS)) return send(res, 403, 'forbidden')
-      try {
-        const st = await fsp.stat(abs)
-        const data = await fsp.readFile(abs)
-        return send(res, 200, data, {
-          'content-type': MIME[path.extname(abs)] || 'application/octet-stream',
-          'accept-ranges': 'bytes',
-          'content-length': st.size,
+      let st
+      try { st = await fsp.stat(abs) } catch { return send(res, 404, 'not found') }
+      const ct = MIME[path.extname(abs)] || 'application/octet-stream'
+      const base = { 'content-type': ct, 'accept-ranges': 'bytes', 'cache-control': 'no-cache' }
+      const rangeM = req.headers.range && req.headers.range.match(/bytes=(\d*)-(\d*)/)
+      if (rangeM) {
+        let start = rangeM[1] === '' ? null : parseInt(rangeM[1], 10)
+        let end = rangeM[2] === '' ? null : parseInt(rangeM[2], 10)
+        if (start === null) { // suffix range: last N bytes
+          start = Math.max(0, st.size - (end || 0))
+          end = st.size - 1
+        }
+        end = Math.min(end ?? st.size - 1, st.size - 1)
+        if (start > end || start >= st.size) {
+          res.writeHead(416, { 'content-range': `bytes */${st.size}` })
+          return res.end()
+        }
+        res.writeHead(206, {
+          ...base,
+          'content-range': `bytes ${start}-${end}/${st.size}`,
+          'content-length': end - start + 1,
         })
-      } catch {
-        return send(res, 404, 'not found')
+        const rs = fs.createReadStream(abs, { start, end })
+        rs.on('error', () => res.destroy())
+        res.on('close', () => rs.destroy())
+        rs.pipe(res)
+      } else {
+        res.writeHead(200, { ...base, 'content-length': st.size })
+        const rs = fs.createReadStream(abs)
+        rs.on('error', () => res.destroy())
+        res.on('close', () => rs.destroy())
+        rs.pipe(res)
       }
+      return
     }
 
     if (p === '/api/health') return json(res, 200, { ok: true, ffmpeg: FFMPEG, aiKey: !!(process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY) })
@@ -236,18 +348,30 @@ const server = http.createServer(async (req, res) => {
       const ct = req.headers['content-type'] || ''
       const bm = ct.match(/boundary=(?:"([^"]+)"|([^;]+))/i)
       if (!bm) return json(res, 400, { error: 'expected multipart/form-data' })
-      const { file } = await parseMultipart(req, bm[1] || bm[2])
-      if (!file || !file.data.length) return json(res, 400, { error: 'no file received' })
       const id = crypto.randomUUID()
       const dir = path.join(JOBS, id)
       await fsp.mkdir(dir, { recursive: true })
+      const tmp = path.join(dir, 'upload.part')
+      let parsed
+      try {
+        parsed = await parseMultipart(req, (bm[1] || bm[2]).trim(), tmp)
+      } catch (e) {
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
+        return json(res, /too large/i.test(e.message) ? 413 : 400, { error: e.message })
+      }
+      const { file } = parsed
+      if (!file || !file.size) {
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
+        return json(res, 400, { error: 'no file received' })
+      }
       const ext = extOf(file.filename, file.mime)
       const fname = `input.${ext}`
-      await fsp.writeFile(path.join(dir, fname), file.data)
+      await fsp.rename(tmp, path.join(dir, fname))
       const meta = await probe(path.join(dir, fname))
       const job = { msgs: [], input: fname, versions: [fname], next: 1 }
       history.set(id, job)
       await fsp.writeFile(path.join(dir, 'job.json'), JSON.stringify(job))
+      console.log(`[ai-studio] upload ${id} ← ${file.filename} (${fmtMB(file.size)})`)
       return json(res, 200, { id, meta, url: `/media/${id}/${encodeURIComponent(fname)}`, original: file.filename })
     }
 
@@ -366,6 +490,16 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { versions: job.versions, msgs: job.msgs })
     }
 
+    // delete a job and all its media
+    if (p === '/api/job' && req.method === 'DELETE') {
+      const id = url.searchParams.get('id') || ''
+      if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)) return json(res, 400, { error: 'bad job id' })
+      history.delete(id)
+      try { await fsp.rm(path.join(JOBS, id), { recursive: true, force: true }) } catch { /* fine */ }
+      console.log(`[ai-studio] deleted job ${id}`)
+      return json(res, 200, { ok: true })
+    }
+
     return send(res, 404, 'not found')
   } catch (e) {
     console.error(e)
@@ -376,4 +510,7 @@ const server = http.createServer(async (req, res) => {
 const PORT = process.env.PORT || 3000
 server.listen(PORT, () => {
   console.log(`\n  🎬 AI Clip Studio  →  http://localhost:${PORT}\n`)
+  console.log(`[ai-studio] job cleanup every 30 min, TTL ${Math.round(JOBS_TTL_MS / 3600000)}h`)
 })
+setInterval(cleanupJobs, 30 * 60 * 1000).unref()
+cleanupJobs()

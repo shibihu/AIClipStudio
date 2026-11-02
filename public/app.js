@@ -4,7 +4,7 @@ const $ = (id) => document.getElementById(id)
 const drop = $('drop'), video = $('video'), chat = $('chat'), form = $('chatForm'),
   input = $('chatInput'), sendBtn = $('sendBtn'), thinking = $('thinking'),
   playerWrap = $('playerWrap'), metaRow = $('metaRow'), downloadBtn = $('downloadBtn'),
-  dlOriginal = $('dlOriginal'), newBtn = $('newBtn'), engineBadge = $('engineBadge')
+  dlOriginal = $('dlOriginal'),   newBtn = $('newBtn'), engineBadge = $('engineBadge'), deleteBtn = $('deleteBtn')
 
 let jobId = null
 let busy = false
@@ -59,6 +59,7 @@ async function upload(file) {
 function showMedia(url, meta, original) {
   playerWrap.classList.remove('hidden')
   drop.classList.add('hidden')
+  deleteBtn.hidden = false
   video.src = url
   metaRow.innerHTML = [
     duration(meta), `${meta.width || '?'}×${meta.height || '?'}`,
@@ -82,6 +83,13 @@ showMedia = function (url, meta, original) {
 }
 
 newBtn.addEventListener('click', () => location.reload())
+
+deleteBtn.addEventListener('click', async () => {
+  if (!jobId) return
+  if (!confirm('Delete this clip and all its versions? This cannot be undone.')) return
+  try { await fetch(`/api/job?id=${encodeURIComponent(jobId)}`, { method: 'DELETE' }) } catch { /* keep going */ }
+  location.reload()
+})
 
 /* ---------- chat ---------- */
 

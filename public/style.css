@@ -92,6 +92,7 @@ main {
 .btn:hover { border-color: #3b4a68; }
 .btn.solid { background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; font-weight: 600; }
 .btn.ghost { color: var(--muted); }
+.btn.danger:hover { border-color: #8a3a48; color: #e2849a; }
 .hidden { display: none !important; }
 
 /* ---------- chat ---------- */
