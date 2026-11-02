@@ -1,0 +1,10 @@
+{
+  "name": "ai-clip-studio",
+  "version": "1.0.0",
+  "description": "Upload a clip, talk to the AI, it edits with ffmpeg. Zero-dependency Node.js app.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT"
+}

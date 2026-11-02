@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Clip Studio — edit video by talking to AI</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>" />
+</head>
+<body>
+  <header>
+    <div class="logo">🎬 <strong>AI&nbsp;Clip&nbsp;Studio</strong></div>
+    <div class="tagline">Upload a clip. Tell the AI what to change. It edits for you.</div>
+    <div id="engineBadge" class="badge" title="AI intent engine">⚡ local engine</div>
+  </header>
+
+  <main>
+    <!-- LEFT: the video stage -->
+    <section id="stage">
+      <div id="drop" class="drop empty"></div>
+
+      <div id="playerWrap" class="hidden">
+        <video id="video" controls playsinline></video>
+        <div id="metaRow" class="meta-row"></div>
+        <div class="stage-actions">
+          <a id="downloadBtn" class="btn solid" download hidden>⬇ Download result</a>
+          <a id="dlOriginal" class="btn ghost" download hidden>⬇ original</a>
+          <button id="newBtn" class="btn ghost">＋ New clip</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: chat -->
+    <section id="chatPanel">
+      <div id="chat" class="chat">
+        <div class="msg ai">
+          👋 Hi! Upload a video on the left, then just tell me what to change.<br />
+          <i>“cut the first 3 seconds and make it square for TikTok”</i> — I’ll turn that into the right ffmpeg pipeline and render it.
+        </div>
+      </div>
+
+      <div id="chips" class="chips">
+        <button data-q="remove the first 2 seconds">✂️ cut first 2s</button>
+        <button data-q="make it square, tiktok format">📐 9:16 crop</button>
+        <button data-q="2x speed">⏩ 2× speed</button>
+        <button data-q="mute the audio">🔇 mute</button>
+        <button data-q="add text 'Good Vibes Only' at the top, big font">💬 text overlay</button>
+        <button data-q="make it a gif at 15 fps">🎞 gif</button>
+        <button data-q="black and white, more contrast">🎨 b&w</button>
+        <button data-q="boomerang">↔ boomerang</button>
+        <button data-q="what can you do?">✨ all abilities</button>
+        <button data-q="louder by 2x and brighter">🔊 audio+light</button>
+      </div>
+
+      <form id="chatForm">
+        <input id="chatInput" type="text" autocomplete="off"
+          placeholder="Tell the AI what to change — e.g. “trim to 0:02–0:08, add text ‘Hello’”" />
+        <button type="submit" id="sendBtn">Edit&nbsp;▶</button>
+      </form>
+      <div id="thinking" class="thinking hidden"><span></span><span></span><span></span> AI is editing your clip…</div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
