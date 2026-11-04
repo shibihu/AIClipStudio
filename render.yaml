@@ -4,8 +4,8 @@
 #
 # Notes:
 #   • No npm dependencies — nothing to install; `npm ci` is skipped on purpose.
-#   • vendor/ffmpeg + vendor/ffprobe (static linux builds, ~51 MB each) are
-#     committed, so ffmpeg works on any Render runtime without apt installs.
+#   • Static ffmpeg builds are committed per-arch (ffmpeg-amd64 for Render,
+#     ffmpeg-arm64 for local dev) — no apt installs needed on the runtime.
 #   • A persistent disk keeps uploaded projects (jobs/) across deploys.
 #     Disks require a paid instance — delete the `disk:` block for the free plan
 #     (job history will reset on every deploy/restart).
@@ -20,7 +20,7 @@ services:
     autoDeployTrigger: commit  # redeploy on every `git push` to the branch below
     region: singapore        # options: oregon | ohio | virginia | frankfurt | singapore
     branch: main
-    buildCommand: chmod +x vendor/ffmpeg vendor/ffprobe || true
+    buildCommand: chmod +x vendor/ffmpeg-* vendor/ffprobe-* || true
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:

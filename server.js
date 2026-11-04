@@ -10,7 +10,7 @@
 //     the client can preview all versions and pin any as the edit base,
 //     a filmstrip API powers the visual trim picker, and captions are
 //     burned in by distributing pasted script lines over detected speech.
-// Used ffmpeg binary: ./vendor/ffmpeg if present, else whatever is on PATH.
+// Used ffmpeg binary: ./vendor/ffmpeg-<arch> if present, else ./vendor/ffmpeg, else whatever is on PATH.
 // ---------------------------------------------------------------------------
 
 // --- load .env (key-value lines) — never committed --------------------------
@@ -45,14 +45,24 @@ const RENDER_CONCURRENCY = 1 // serialize renders: one ffmpeg at a time
 fs.mkdirSync(JOBS, { recursive: true })
 
 // --- locate ffmpeg/ffprobe --------------------------------------------------
-let FFMPEG = path.join(ROOT, 'vendor', 'ffmpeg')
-let FFPROBE = path.join(ROOT, 'vendor', 'ffprobe')
+// Binaries are vendored per-arch: ffmpeg-amd64 (Render x64) / ffmpeg-arm64.
+// Falls back to a plain vendor/ffmpeg, then to whatever is on PATH.
+const ARCH = process.arch === 'x64' ? 'amd64' : process.arch
+let FFMPEG = path.join(ROOT, 'vendor', `ffmpeg-${ARCH}`)
+let FFPROBE = path.join(ROOT, 'vendor', `ffprobe-${ARCH}`)
 try {
   fs.accessSync(FFMPEG, fs.constants.X_OK)
   fs.accessSync(FFPROBE, fs.constants.X_OK)
 } catch {
-  FFMPEG = 'ffmpeg'
-  FFPROBE = 'ffprobe'
+  FFMPEG = path.join(ROOT, 'vendor', 'ffmpeg')
+  FFPROBE = path.join(ROOT, 'vendor', 'ffprobe')
+  try {
+    fs.accessSync(FFMPEG, fs.constants.X_OK)
+    fs.accessSync(FFPROBE, fs.constants.X_OK)
+  } catch {
+    FFMPEG = 'ffmpeg'
+    FFPROBE = 'ffprobe'
+  }
 }
 
 function findFont() {
