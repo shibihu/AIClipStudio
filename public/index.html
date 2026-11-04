@@ -11,8 +11,34 @@
   <header>
     <div class="logo">🎬 <strong>AI&nbsp;Clip&nbsp;Studio</strong></div>
     <div class="tagline">Upload a clip. Tell the AI what to change. It edits for you.</div>
+    <button id="projectsBtn" class="btn ghost">📂 Projects</button>
     <div id="engineBadge" class="badge" title="AI intent engine">⚡ local engine</div>
   </header>
+
+  <!-- access-token login (shown only when the server runs with AUTH_TOKEN set) -->
+  <div id="authGate" class="authgate hidden">
+    <div class="authcard">
+      <div class="authlogo">🔒</div>
+      <h2>AI Clip Studio is locked</h2>
+      <p class="authsub">Enter the access token to continue.</p>
+      <form id="authForm">
+        <input id="authToken" type="password" placeholder="access token" autocomplete="current-password" />
+        <button type="submit" class="btn solid">Unlock</button>
+      </form>
+      <div id="authErr" class="autherr"></div>
+    </div>
+  </div>
+
+  <!-- recent projects modal -->
+  <div id="projectsModal" class="modal hidden">
+    <div class="modalcard">
+      <div class="modalhead">
+        <strong>📂 My projects</strong>
+        <button id="projClose" class="btn ghost">✕</button>
+      </div>
+      <div id="projList" class="projlist"></div>
+    </div>
+  </div>
 
   <main>
     <!-- LEFT: the video stage -->
@@ -22,6 +48,22 @@
       <div id="playerWrap" class="hidden">
         <video id="video" controls playsinline></video>
         <div id="metaRow" class="meta-row"></div>
+        <div id="versionStrip" class="vstrip hidden"></div>
+        <div id="trimWrap" class="trimwrap hidden">
+          <div id="trimStrip" class="tstrip">
+            <img id="stripImg" alt="filmstrip of the clip" draggable="false" />
+            <div id="trimRange" class="trange"></div>
+            <div id="trimIn" class="thandle in"></div>
+            <div id="trimOut" class="thandle out"></div>
+            <div id="tLabelA" class="tlabel">0:00</div>
+            <div id="tLabelB" class="tlabel">0:00</div>
+          </div>
+          <div class="trimrow">
+            <button id="trimApply" class="btn solid">✂️ Trim to selection</button>
+            <button id="trimClear" class="btn ghost">reset</button>
+            <span class="hint2">drag the handles · drag scrubs the video</span>
+          </div>
+        </div>
         <div class="stage-actions">
           <a id="downloadBtn" class="btn solid" download hidden>⬇ Download result</a>
           <a id="dlOriginal" class="btn ghost" download hidden>⬇ original</a>
@@ -40,15 +82,26 @@
         </div>
       </div>
 
+      <div id="capWrap" class="capwrap hidden">
+        <textarea id="capText" rows="4" placeholder="Paste (or type) your script — one line per caption. I detect the speech segments, fit your lines onto them and burn timed captions in."></textarea>
+        <div class="caprow">
+          <button id="capSend" class="btn solid">💬 Burn in captions</button>
+          <button id="capAuto" class="btn ghost">🎙 Auto-transcribe</button>
+          <span class="hint2">paste = timed with silence detection · auto = Gemini transcribes the actual speech</span>
+        </div>
+      </div>
+
       <div id="chips" class="chips">
         <button data-q="remove the first 2 seconds">✂️ cut first 2s</button>
-        <button data-q="make it square, tiktok format">📐 9:16 crop</button>
+        <button data-q="crop to 9:16 for tiktok, scale to 1080p">📱 TikTok ready</button>
         <button data-q="2x speed">⏩ 2× speed</button>
         <button data-q="mute the audio">🔇 mute</button>
+        <button id="capChip">🗣 captions from script</button>
         <button data-q="add text 'Good Vibes Only' at the top, big font">💬 text overlay</button>
         <button data-q="make it a gif at 15 fps">🎞 gif</button>
         <button data-q="black and white, more contrast">🎨 b&w</button>
         <button data-q="boomerang">↔ boomerang</button>
+        <button data-q="what edits would you suggest for this clip?">🧠 suggest edits</button>
         <button data-q="what can you do?">✨ all abilities</button>
         <button data-q="louder by 2x and brighter">🔊 audio+light</button>
       </div>

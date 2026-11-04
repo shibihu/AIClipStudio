@@ -10,6 +10,9 @@ function num(str) {
   return m ? parseFloat(m[1].replace(',', '.')) : null
 }
 
+const path = require('path')
+const fs = require('fs')
+
 function even(n) {
   n = Math.round(n)
   return n % 2 ? n + 1 : n
@@ -82,8 +85,11 @@ function understand(message, meta) {
   }
 
   // ---- speed ----
-  const rateM = s.match(/(\d+(?:[.,]\d+)?)\s*(?:x|×|times)\b/) || s.match(/speed\s*(?:it\s*)?(?:up|down)?\s*(?:by\s*)?(\d+(?:[.,]\d+)?)/)
-  if (rateM && /(speed|fast|x|×|times)/.test(s)) {
+  // "louder 2x"/"volume 2x" are audio intents — don't let the bare "2x" grab them
+  const audioIntent = /(louder|quieter|volume|audio|sound)/.test(s)
+  const rateM = audioIntent ? null
+    : s.match(/(\d+(?:[.,]\d+)?)\s*(?:x|×|times)\b/) || s.match(/speed\s*(?:it\s*)?(?:up|down)?\s*(?:by\s*)?(\d+(?:[.,]\d+)?)/)
+  if (rateM && /(speed|fast|slow|x|×|times)/.test(s)) {
     const rate = parseFloat(rateM[1].replace(',', '.'))
     if (rate && rate > 1) {
       ops.push({ kind: 'speed', label: `${rate}× speed`, vf: `setpts=PTS/${rate}`, af: `atempo=${atempoChain(rate).join(',atempo=')}` })
@@ -221,10 +227,10 @@ function build(ops, meta, fontFile) {
             const vtrim = `trim=start=${a}${b != null ? `:end=${b}` : ''},setpts=PTS-STARTPTS`
             out._trimFilters = { v: vtrim, a: `atrim=start=${a}${b != null ? `:end=${b}` : ''},asetpts=PTS-STARTPTS` }
           }
-        } else {
-          if (op.from != null) out.extraArgs.push('-ss', String(op.from))
-          if (op.to != null) out.extraArgs.push('-to', String(op.to))
-          if (op.to == null && op.from == null) out.extraArgs.push('-to', '5')
+        } else if (!out.seek) {
+          // input-side fast seek: `-ss` before `-i` re-encodes accurately
+          // but skips decoding everything before the cut point
+          out.seek = { from: op.from ?? null, to: op.to ?? null }
         }
         break
       case 'mute':
@@ -331,9 +337,39 @@ Dialogue: 0,0:00:00.00,${assTimestamp(end)},A,0,0,0,,${String(op.text).replace(/
 }
 
 // ---------------------------------------------------------------------------
+// makeCaptionAss — timed multi-cue `.ass` caption burn-in. The server places
+// cues on detected speech segments (silencedetect), here we just render them.
+// Returns the `subtitles=<path>` video filter expression.
+// ---------------------------------------------------------------------------
 
-const path = require('path')
-const fs = require('fs')
+function makeCaptionAss(cues, meta, dir) {
+  const w = meta.width || 1280
+  const h = meta.height || 720
+  const name = `captions-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}.ass`
+  const size = Math.round(Math.min(Math.max(h * 0.055, 20), h * 0.12, 64))
+  const margin = Math.round(h * 0.07)
+  const events = cues.map((c) =>
+    `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},A,0,0,${Math.round(h * 0.06)},,${String(c.text).replace(/\n/g, '\\N')}`
+  ).join('\n')
+  const ass = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${w}
+PlayResY: ${h}
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
+Style: A,DejaVu Sans,${size},&H00FFFFFF,&H00101010,&H64000000,1,3,1,2,${Math.round(w * 0.05)},${Math.round(w * 0.05)},${margin},1,1
+
+[Events]
+Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
+${events}
+`
+  fs.writeFileSync(path.join(dir, name), ass)
+  return `subtitles='${path.join(path.resolve(dir), name).replace(/\\/g, '/')}'`
+}
+
+// ---------------------------------------------------------------------------
 
 const SYSTEM_PROMPT = `You are the AI assistant of "AI Clip Studio", a video editing web app. The user's messages are free-form: accept ANY request they type, in their own words and any language — both edit commands and questions.
 Reply with ONLY JSON: {"ops":[...],"summary":"one friendly sentence"}.
@@ -359,7 +395,8 @@ Allowed edit operation kinds and their fields:
 For ANY other visual or audio effect express it with a generic filter op so arbitrary user requests still work:
 {"kind":"filter","vf":"<single ffmpeg video filter expression>","label":"short description"} — e.g. "eq=hue=0.2" for a hue shift, "vignette", "fade=t=in:st=0:d=1", "colorlevels=rimin=0.1", "curves=vintage", "chromashift", "tweak=hs=20", "hue=s=1.3", "crops" only via trim/aspect. The expression must be ONE filter or comma-joined filters, using only ffmpeg syntax (no quotes, no backslashes, no file paths).
 {"kind":"afilter","af":"<single ffmpeg audio filter expression>","label":"short description"} — e.g. "bass=g=8", "aecho=0.8:0.7:60:0.5", "highpass=f=200", "compand". Same syntax restrictions.
-Do not use file-based filters (drawtext with fontfile, subtitles, movie, amovie, opencl, overlay with images) — text overlays are handled by the built-in text op. Prefer the specific ops above when they fit; use filter/afilter only for effects they don't cover. You may chain multiple edits in one message.`
+Do not use file-based filters (drawtext with fontfile, subtitles, movie, amovie, opencl, overlay with images) — text overlays are handled by the built-in text op. Prefer the specific ops above when they fit; use filter/afilter only for effects they don't cover. You may chain multiple edits in one message.
+When images are attached to the user's message they are frames sampled across the clip in order (first image = start of the clip, last = end). Use them to understand what actually happens in the video: for suggestions ("what edits would suit this?"), reference specific things you can see (subject, scene changes, framing, lighting, text already on screen). Never describe moments you cannot see in the frames or infer from metadata. When the user asks for the most engaging part, pick the segment(s), and prefer concrete ops (e.g. a trim keeping the liveliest frames) over vague advice.`
 
 const FILTER_SAFE = /^[A-Za-z0-9 _=:/.,()+?*%!-]{0,500}$/
 const FILTER_BLOCKED = /\b(file|protocol|opencl|movie|amovie|subtitles|drawtext|overlay|lavfi|protected|stdin|stdout)\b/i
@@ -375,37 +412,88 @@ function safeFilter(s) {
 
 const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur', 'filter', 'afilter', 'chat'])
 
+// --- LLM providers -------------------------------------------------------------
+// Message `content` may be a plain string OR an array of typed parts for
+// multi-modal (vision) requests:
+//   { type:'text',  text }            — plain text
+//   { type:'image', mime, data }      — base64 image (mime e.g. 'image/jpeg')
+// Every provider unifies: (a) part conversion, (b) JSON-output instruction,
+// (c) retry with exponential backoff on 429/5xx, (d) health reporting used by
+// /api/health so the UI can show an "LLM unreachable" badge.
+
+const llmHealth = {
+  reachable: null,            // null = never called; true = last call ok
+  lastError: null,            // last error message
+  lastErrorAt: 0,             // Date.now() of last failure
+  lastOkAt: 0,                // Date.now() of last success
+  provider: null,
+}
+
+function getLlmHealth() { return { ...llmHealth, aiKey: !!activeProvider() } }
+
+function activeProvider() {
+  for (const p of PROVIDERS) if (p.key()) return p
+  return null
+}
+
+function noteLlmOk(provider) {
+  llmHealth.reachable = true
+  llmHealth.lastError = null
+  llmHealth.lastOkAt = Date.now()
+  llmHealth.provider = provider
+}
+
+function noteLlmError(provider, e) {
+  llmHealth.reachable = false
+  llmHealth.lastError = `${provider}: ${String(e.message || e).slice(0, 240)}`
+  llmHealth.lastErrorAt = Date.now()
+}
+
+// retry transient failures (429 rate-limit / 5xx server errors) with backoff
+async function withRetry(fn, { attempts = 3, baseMs = 1500 } = {}) {
+  let last
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn() } catch (e) {
+      if (!/http (429|5\d\d)/.test(e.message)) throw e
+      last = e
+      await new Promise((ok) => setTimeout(ok, baseMs * (i + 1)))
+    }
+  }
+  throw last
+}
+
+// typed content → provider-specific message bodies
+function toGemini(content) {
+  return { role: 'user', parts: partsOf(content).map((p) => p.type === 'image'
+    ? { inline_data: { mime_type: p.mime, data: p.data } }
+    : { text: p.text }) }
+}
+
+function partsOf(content) {
+  if (typeof content === 'string') return [{ type: 'text', text: content }]
+  return (content || []).map((p) => (p.type === 'image' ? { type: 'image', mime: p.mime, data: p.data } : { type: 'text', text: p.text }))
+}
+
 const PROVIDERS = [
   {
     name: 'gemini',
     key: () => process.env.GEMINI_API_KEY,
     model: () => process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-    _raw: async function (system, msgs, model) {
-      const sys = { role: 'user', parts: [{ text: system }] }
-      const toParts = (m) => ({ role: m.role, parts: [{ text: m.content }] })
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.key())}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: sys,
-          contents: [...msgs.map(toParts), { parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] }],
-          generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
-        }),
-      })
-      if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
-      const j = await r.json()
-      return j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || null
-    },
     async call(system, msgs, model) {
-      let last
-      for (let i = 0; i < 3; i++) {
-        try { return await this._raw(system, msgs, model) } catch (e) {
-          if (!/http (429|5\d\d)/.test(e.message)) throw e
-          last = e
-          await new Promise((ok) => setTimeout(ok, 1500 * (i + 1)))
-        }
-      }
-      throw last
+      return withRetry(async () => {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.key())}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { role: 'user', parts: [{ text: system }] },
+            contents: [...msgs.map((m) => toGemini(m.content)), { role: 'user', parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] }],
+            generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+          }),
+        })
+        if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
+        const j = await r.json()
+        return j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || null
+      })
     },
   },
   {
@@ -413,18 +501,26 @@ const PROVIDERS = [
     key: () => process.env.OPENAI_API_KEY,
     model: () => process.env.OPENAI_MODEL || 'gpt-4o-mini',
     async call(system, msgs, model) {
-      const r = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.key()}` },
-        body: JSON.stringify({
-          model,
-          response_format: { type: 'json_object' },
-          messages: [{ role: 'system', content: system }, ...msgs, { role: 'user', content: 'Remember: answer ONLY with the JSON object.' }],
-        }),
+      return withRetry(async () => {
+        const toMsg = (m) => {
+          const parts = partsOf(m.content).map((p) => p.type === 'image'
+            ? { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } }
+            : { type: 'text', text: p.text })
+          return { role: m.role, content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts }
+        }
+        const r = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.key()}` },
+          body: JSON.stringify({
+            model,
+            response_format: { type: 'json_object' },
+            messages: [{ role: 'system', content: system }, ...msgs.map(toMsg), { role: 'user', content: 'Remember: answer ONLY with the JSON object.' }],
+          }),
+        })
+        if (!r.ok) throw new Error(`openai http ${r.status}`)
+        const j = await r.json()
+        return j.choices?.[0]?.message?.content || null
       })
-      if (!r.ok) throw new Error(`openai http ${r.status}`)
-      const j = await r.json()
-      return j.choices?.[0]?.message?.content || null
     },
   },
   {
@@ -432,14 +528,22 @@ const PROVIDERS = [
     key: () => process.env.ANTHROPIC_API_KEY,
     model: () => process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022',
     async call(system, msgs, model) {
-      const r = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-api-key': this.key(), 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model, max_tokens: 2048, system, messages: msgs }),
+      return withRetry(async () => {
+        const toMsg = (m) => {
+          const parts = partsOf(m.content).map((p) => p.type === 'image'
+            ? { type: 'image', source: { type: 'base64', media_type: p.mime, data: p.data } }
+            : { type: 'text', text: p.text })
+          return { role: m.role, content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts }
+        }
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': this.key(), 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model, max_tokens: 2048, system, messages: msgs.map(toMsg) }),
+        })
+        if (!r.ok) throw new Error(`anthropic http ${r.status}`)
+        const j = await r.json()
+        return j.content?.[0]?.text || null
       })
-      if (!r.ok) throw new Error(`anthropic http ${r.status}`)
-      const j = await r.json()
-      return j.content?.[0]?.text || null
     },
   },
 ]
@@ -502,31 +606,197 @@ function normalizeOps(parsed, mediaInfo) {
   return { ops: final, summary: parsed.summary || final.map((o) => o.label).join(' + '), isLLM: true }
 }
 
-async function understandWithLLM(message, meta, history) {
-  const videoInfo = `Video is ${meta.duration}s, ${meta.width}x${meta.height}, ${meta.hasAudio ? 'has audio' : 'no audio'}, ${meta.fps || '?'}fps.`
+async function understandWithLLM(message, meta, history, frames) {
+  const videoInfo =
+    `Video is ${meta.duration}s, ${meta.width}x${meta.height}, ${meta.hasAudio ? 'has audio' : 'no audio'}, ${meta.fps || '?'}fps.` +
+    (frames?.length ? ` ${frames.length} sample frames are attached (in clip order).` : '')
   const system = SYSTEM_PROMPT + ' ' + videoInfo
   const msgs = [...history.slice(-8), { role: 'user', content: message }]
-  for (const p of PROVIDERS) {
-    if (!p.key()) continue
-    try {
-      const raw = await p.call(system, msgs, p.model())
-      if (!raw) continue
-      const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
-      const parsed = JSON.parse(cleaned)
-      const nx = normalizeOps(parsed, meta)
-      if (nx) {
-        if (nx.isChat) return { isChat: true, reply: nx.reply, isLLM: true, summary: '' }
-        return nx
-      }
-      // model answered JSON but no usable ops — treat summary as a chat reply
-      if (parsed && parsed.summary && !Array.isArray(parsed.ops)) {
-        return { isChat: true, reply: String(parsed.summary), isLLM: true, summary: '' }
-      }
-    } catch (e) {
-      console.error(`[ai] LLM provider "${p.name}" failed:`, e.message)
+  const p = activeProvider()
+  if (!p) return null
+  // attach vision frames to the final user message when provided
+  if (Array.isArray(frames) && frames.length && typeof p.call !== 'undefined') {
+    const parts = frames.map((f) => ({ type: 'image', mime: f.mime || 'image/jpeg', data: f.data }))
+    parts.push({ type: 'text', text: 'These images are the sample frames (in clip order). Use them if relevant.' })
+    msgs[msgs.length - 1] = { role: 'user', content: typeof msgs[msgs.length - 1].content === 'string'
+      ? partsOfLast(message, parts)
+      : msgs[msgs.length - 1].content.concat(parts) }
+  }
+  try {
+    const raw = await p.call(system, msgs, p.model())
+    noteLlmOk(p.name)
+    if (!raw) return null
+    const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
+    const parsed = JSON.parse(extractJson(cleaned))
+    const nx = normalizeOps(parsed, meta)
+    if (nx) {
+      if (nx.isChat) return { isChat: true, reply: nx.reply, isLLM: true, summary: '' }
+      return nx
     }
+    // model answered JSON but no usable ops — treat summary as a chat reply
+    if (parsed && parsed.summary && !Array.isArray(parsed.ops)) {
+      return { isChat: true, reply: String(parsed.summary), isLLM: true, summary: '' }
+    }
+  } catch (e) {
+    console.error(`[ai] LLM provider "${p.name}" failed:`, e.message)
+    noteLlmError(p.name, e)
   }
   return null
 }
 
-module.exports = { understand, understandWithLLM, build, makeTextOverlay }
+// build a text+images content array; put the question text first, images after
+function partsOfLast(message, imageParts) {
+  return [{ type: 'text', text: message }, ...imageParts]
+}
+
+// tolerate stray prose around the JSON object the model may emit
+function extractJson(s) {
+  const a = s.indexOf('{')
+  const b = s.lastIndexOf('}')
+  return a !== -1 && b !== -1 && b > a ? s.slice(a, b + 1) : s
+}
+
+// ---------------------------------------------------------------------------
+// captions — pure cue math lives here (unit-testable); ffmpeg speech detection
+// (silencedetect) stays in server.js. Two caption sources:
+//   • pasted script  → buildCues(text) → server spreads them over speech segs
+//   • STT transcript → transcribeAudio() → normalizeTranscriptCues(cues, meta)
+// ---------------------------------------------------------------------------
+
+function buildCues(text) {
+  const cues = []
+  const wrap = (s, max) => {
+    const words = s.split(/\s+/)
+    const out = []
+    let cur = ''
+    for (const w of words) {
+      if (cur && (cur + ' ' + w).length > max) { out.push(cur); cur = w } else cur = (cur ? cur + ' ' : '') + w
+    }
+    if (cur) out.push(cur)
+    return out
+  }
+  for (let line of String(text || '').split(/\r?\n+/)) {
+    line = line.trim()
+    if (!line) continue
+    cues.push(...wrap(line, 48))
+  }
+  return cues.slice(0, 80)
+}
+
+// spread cues across segments proportionaly to each segment's length
+function placeCues(cues, segs) {
+  const placed = []
+  const total = segs.reduce((a, s) => a + (s[1] - s[0]), 0) || 1
+  let ci = 0
+  for (let i = 0; i < segs.length && ci < cues.length; i++) {
+    const [a, b] = segs[i]
+    let n = Math.max(1, Math.round(((b - a) / total) * cues.length))
+    if (i === segs.length - 1) n = cues.length - ci // last segment takes the rest
+    n = Math.max(1, Math.min(cues.length - ci, n))
+    const d = (b - a) / n
+    for (let k = 0; k < n && ci < cues.length; k++) {
+      placed.push({ text: cues[ci++], start: a + k * d, end: a + (k + 1) * d })
+    }
+  }
+  return placed
+}
+
+// --- speech-to-text captions (Gemini inline audio) -----------------------------
+// Sends a small mono audio track to the configured LLM and asks for timestamped
+// caption cues. Returns [{text, start, end}] or null (no key / any failure).
+// The caller must have produced an ffmpeg-readable mpeg audio file first.
+
+const STT_PROMPT = `You are a captioning engine. Transcribe ALL spoken words in this audio.
+Return ONLY JSON (no markdown, no commentary): {"cues":[{"text":"...","start":0.0,"end":1.2}]}
+Rules:
+- start/end are numbers in seconds, relative to the audio start.
+- One cue per natural caption: break at sentence ends or natural pauses, max ~12 words per cue.
+- text contains only the spoken words (no speaker labels, no timestamps inside the text).
+- Keep the original language. If there is no speech, return {"cues":[]}.`
+
+async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) {
+  const p = activeProvider()
+  if (!p || p.name !== 'gemini') return null
+  const model = p.model()
+  try {
+    const buf = await fs.promises.readFile(audioPath)
+    if (buf.length > maxBytes) { console.error('[ai] STT: audio too large', buf.length); return null }
+    const raw = await withRetry(async () => {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(p.key())}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { role: 'user', parts: [{ text: 'You transcribe audio and answer ONLY with the JSON object.' }] },
+          contents: [{
+            role: 'user',
+            parts: [
+              { inline_data: { mime_type: 'audio/mpeg', data: buf.toString('base64') } },
+              { text: STT_PROMPT },
+            ],
+          }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
+        }),
+      })
+      if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
+      const j = await r.json()
+      return j.candidates?.[0]?.content?.parts?.map((x) => x.text || '').join('') || null
+    })
+    noteLlmOk(p.name)
+    if (!raw) return null
+    const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
+    const parsed = JSON.parse(extractJson(cleaned))
+    const cues = Array.isArray(parsed.cues) ? parsed.cues : Array.isArray(parsed) ? parsed : []
+    const out = []
+    for (const c of cues) {
+      const text = String(c?.text || '').replace(/\s+/g, ' ').trim()
+      const start = +c?.start, end = +c?.end
+      if (text && Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        out.push({ text, start: Math.max(0, start), end })
+      }
+    }
+    return out
+  } catch (e) {
+    console.error('[ai] STT transcription failed:', e.message)
+    noteLlmError(p.name, e)
+    return null
+  }
+}
+
+// turn raw STT cues into render-ready cue list:
+//  • validate/clip timestamps to media duration, drop zero-length cues, sort
+//  • wrap long lines into ≤ maxChars chunks spread evenly over the cue window
+function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxCues = 120 } = {}) {
+  const dur = typeof meta?.duration === 'number' && meta.duration > 0 ? meta.duration : null
+  const valid = (Array.isArray(cues) ? cues : [])
+    .map((c) => ({
+      text: String(c?.text || '').replace(/\s+/g, ' ').trim(),
+      start: Math.max(0, +c?.start || 0),
+      end: Math.max(0, +c?.end || 0),
+    }))
+    .filter((c) => c.text && c.end > c.start + 0.15 && (dur == null || c.start < dur))
+    .map((c) => ({ text: c.text, start: c.start, end: dur != null ? Math.min(c.end, dur) : c.end }))
+    .sort((a, b) => a.start - b.start)
+
+  const out = []
+  for (const c of valid) {
+    const words = c.text.split(' ')
+    const lines = []
+    let cur = ''
+    for (const w of words) {
+      if (cur && (cur + ' ' + w).length > maxChars) { lines.push(cur); cur = w } else cur = cur ? cur + ' ' + w : w
+    }
+    if (cur) lines.push(cur)
+    const d = (c.end - c.start) / lines.length
+    lines.forEach((text, i) => {
+      if (out.length < maxCues) out.push({ text, start: +((c.start + i * d)).toFixed(2), end: +((c.start + (i + 1) * d)).toFixed(2) })
+    })
+    if (out.length >= maxCues) break
+  }
+  return out
+}
+
+module.exports = {
+  understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
+  buildCues, placeCues, transcribeAudio, normalizeTranscriptCues,
+  getLlmHealth, extractJson, safeFilter, normalizeOps,
+}

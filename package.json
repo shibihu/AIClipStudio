@@ -4,7 +4,8 @@
   "description": "Upload a clip, talk to the AI, it edits with ffmpeg. Zero-dependency Node.js app.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/engine.test.js"
   },
   "license": "MIT"
 }
