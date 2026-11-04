@@ -362,8 +362,8 @@ let activeRuns = 0
 
 // user message → done/failed replies are appended to the chat history when the
 // render settles, so /api/job stays consistent with what was actually made.
-// A pending.json marker survives server restarts: rehydrateRenders() gives
-// interrupted renders a "server restarted" failure instead of a dangling poll.
+// A pending.json marker survives server restarts: rehydrateRenders() re-queues
+// the interrupted render on boot (or reports it as failed if the source is gone).
 async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
   const src = path.join(JOBS, jobId, srcName)
   const outName = `out-${job.next++}.${frag.output}`
@@ -421,7 +421,7 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
     await fsp.writeFile(path.join(JOBS, jobId, 'pending.json'), JSON.stringify({
       rid, srcName, args, cmdDisplay, outPath, outName,
       summary: reg.summary, ops: reg.ops, userMsg, fromIndex: job.base,
-      createdAt: Date.now(),
+      expected, createdAt: Date.now(),
     }))
   } catch { /* best-effort marker */ }
   pumpRenders()
@@ -516,18 +516,39 @@ async function startRender(reg) {
   }
 }
 
-// restart safety: pending.json markers left behind by a crash/restart become
-// visible "lost render" failures the client can still poll
+// restart safety: pending.json markers left behind by a crash/restart are
+// RE-QUEUED on boot — the marker carries the full ffmpeg command, so a deploy
+// or restart no longer loses an edit. Only a missing/malformed marker or a
+// gone source file falls back to a visible "lost render" failure the client
+// can still poll.
 async function rehydrateRenders() {
   let names
   try { names = await fsp.readdir(JOBS) } catch { return }
   for (const id of names) {
     if (/^_/.test(id) || !/^[a-f0-9-]{16,64}$/.test(id)) continue
-    try {
-      const pend = JSON.parse(await fsp.readFile(path.join(JOBS, id, 'pending.json'), 'utf8'))
-      if (!pend || !pend.rid) throw new Error('bad marker')
+    let pend
+    try { pend = JSON.parse(await fsp.readFile(path.join(JOBS, id, 'pending.json'), 'utf8')) } catch { continue }
+    if (!pend || !pend.rid || !Array.isArray(pend.args)) {
+      await fsp.rm(path.join(JOBS, id, 'pending.json'), { force: true }).catch(() => {})
+      continue
+    }
+    // can the source be re-rendered at all?
+    const sourceOk = await fsp.stat(path.join(JOBS, id, pend.srcName)).then(() => true, () => false)
+    if (sourceOk) {
+      renders.set(pend.rid, {
+        rid: pend.rid, jobId: id, status: 'queued', progress: 0,
+        srcName: pend.srcName, args: pend.args, cmdDisplay: pend.cmdDisplay,
+        outPath: pend.outPath, outName: pend.outName,
+        summary: pend.summary || '', ops: pend.ops || [],
+        userMsg: pend.userMsg, fromIndex: pend.fromIndex ?? null,
+        expected: pend.expected || 0, proc: null, media: null, thumb: null, reply: null,
+      })
+      // the marker stays until this requeued render finishes (startRender removes it)
+      renderQueue.push(pend.rid)
+      console.log(`[ai-studio] render ${id}/${pend.outName} survived a restart → requeued`)
+    } else {
       const job = loadJob(id)
-      const reply = '⚠️ The server restarted while this render was queued/running, so it was lost. Send the edit again — I\'ll re-run it right away.'
+      const reply = '⚠️ The server restarted while this render was running and its source file is gone. Upload the clip again — I\'ll re-run the edit right away.'
       renders.set(pend.rid, {
         rid: pend.rid, jobId: id, status: 'failed', progress: 0,
         srcName: pend.srcName, args: pend.args, cmdDisplay: pend.cmdDisplay,
@@ -541,9 +562,10 @@ async function rehydrateRenders() {
         await saveJob(job, id)
       }
       await fsp.rm(path.join(JOBS, id, 'pending.json'), { force: true }).catch(() => {})
-      console.log(`[ai-studio] rehydrated interrupted render ${id}/${pend.outName} as failed`)
-    } catch { /* no marker or unreadable — fine */ }
+      console.log(`[ai-studio] rehydrated interrupted render ${id}/${pend.outName} as failed (source gone)`)
+    }
   }
+  if (renderQueue.length) pumpRenders()
 }
 
 // --- captions: distribute pasted script lines over detected speech -----------
