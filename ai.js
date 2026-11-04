@@ -287,9 +287,11 @@ function build(ops, meta, fontFile) {
   }
 
   if (out.output === 'mp3') {
-    // audio extraction: drop video filters
+    // audio extraction: drop video filters; -an would leave zero streams
+    // (mute + "export audio" must still produce a valid mp3)
     out.vf = []
     out.complex = null
+    out.extraArgs = out.extraArgs.filter((a) => a !== '-an')
   }
   return out
 }

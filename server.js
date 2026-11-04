@@ -256,13 +256,16 @@ function ffprobeJson(file) {
 
 async function probe(file) {
   const j = await ffprobeJson(file)
-  if (!j) return { duration: null, width: null, height: null, hasAudio: true, fps: 30 }
+  if (!j) return { duration: null, width: null, height: null, hasVideo: true, hasAudio: true, fps: 30 }
   const v = (j.streams || []).find((s) => s.codec_type === 'video')
   const a = (j.streams || []).find((s) => s.codec_type === 'audio')
   const meta = {
     duration: j.format ? Math.round(parseFloat(j.format.duration) * 100) / 100 : null,
     width: v?.width || null,
     height: v?.height || null,
+    // hasVideo===false means audio-only (exported mp3 / audio upload): visual
+    // edits and even -an must never run here (ffmpeg picks zero streams)
+    hasVideo: !!v,
     hasAudio: !!a,
     fps: v && v.avg_frame_rate && v.avg_frame_rate.includes('/') ? Math.round((v.avg_frame_rate.split('/').reduce((a2, b) => a2 / b)) * 100) / 100 : 30,
     format: j.format?.format_name || 'unknown',
@@ -492,8 +495,11 @@ async function startRender(reg) {
       reg.reply =
         `${reg.fromIndex === job.versions.length - 1 ? '✅' : '✅ (from v' + (reg.fromIndex + 1) + ')'} Done — ${reg.summary}.` +
         `${outMeta.duration ? ` New length: ${outMeta.duration}s.` : ''} I ran:\n\n\`${reg.cmdDisplay}\`\n\nWhat's next?`
-      job.versions.push({ name: reg.outName, desc: reg.summary, thumb: reg.thumb, meta: { duration: outMeta.duration, width: outMeta.width, height: outMeta.height, hasAudio: outMeta.hasAudio, fps: outMeta.fps } })
-      job.base = job.versions.length - 1
+      job.versions.push({ name: reg.outName, desc: reg.summary, thumb: reg.thumb, meta: { duration: outMeta.duration, width: outMeta.width, height: outMeta.height, hasVideo: outMeta.hasVideo, hasAudio: outMeta.hasAudio, fps: outMeta.fps } })
+      // audio-only outputs (exported mp3) become a version, but the edit base
+      // must stay on video — editing "from" an mp3 is what caused
+      // "Output file does not contain any stream" render failures
+      if (outMeta.hasVideo !== false) job.base = job.versions.length - 1
       job.msgs.push({ role: 'user', content: reg.userMsg }, { role: 'assistant', content: reg.reply })
       await saveJob(job, reg.jobId)
       console.log(`[ai-studio] render ${reg.jobId}/${reg.outName} done → v${vN}`)
@@ -806,7 +812,7 @@ const server = http.createServer(async (req, res) => {
           name: fname,
           desc: 'original upload',
           thumb: thumbOk ? `/media/${id}/${encodeURIComponent(`thumb-${fname}.jpg`)}` : null,
-          meta: { duration: meta.duration, width: meta.width, height: meta.height, hasAudio: meta.hasAudio, fps: meta.fps },
+          meta: { duration: meta.duration, width: meta.width, height: meta.height, hasVideo: meta.hasVideo, hasAudio: meta.hasAudio, fps: meta.fps },
         }],
         base: 0,
         next: 1,
@@ -885,6 +891,14 @@ const server = http.createServer(async (req, res) => {
       // 2) build the ffmpeg pipeline
       if (!meta.hasAudio && result.ops.some((o) => ['audioOut', 'volume'].includes(o.kind))) {
         const reply = "This version has no audio track (it's a GIF or was muted), so there's nothing to extract or adjust there. Try a visual edit instead — or pin another version with ★."
+        job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+        return json(res, 200, { reply, commands: [], media: null })
+      }
+      // audio-only source (note: visual edits or mute here make ffmpeg pick
+      // zero streams → "Output file does not contain any stream")
+      const AUDIO_ONLY_OK = new Set(['trim', 'audioOut', 'volume', 'afilter'])
+      if (meta.hasVideo === false && !(result.ops.length && result.ops.every((o) => AUDIO_ONLY_OK.has(o.kind)))) {
+        const reply = "That version is audio-only (it's an exported mp3 or an audio upload), so visual edits can't run from here. Pin a video version with ★ and try again — or keep going with audio-only edits like \"louder\", \"extract the audio\" or \"trim\"."
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
       }
@@ -993,6 +1007,11 @@ const server = http.createServer(async (req, res) => {
       const meta = await probe(src)
       if (!meta.hasAudio) {
         const reply = "That version has no audio track, so I can't caption speech here. Pin a version with sound (★) or upload the clip with audio."
+        job.msgs.push({ role: 'user', content: 'add captions' }, { role: 'assistant', content: reply })
+        return json(res, 200, { reply, commands: [], media: null })
+      }
+      if (meta.hasVideo === false) {
+        const reply = "That version is audio-only, so there's nothing to burn captions onto. Pin the video version with ★ first."
         job.msgs.push({ role: 'user', content: 'add captions' }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
       }

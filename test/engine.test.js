@@ -204,6 +204,21 @@ test('build: audioOut switches output to mp3 and drops video filters', () => {
   assert.equal(frag.vf.length, 0)
 })
 
+test('build: mute + audioOut still yields a renderable mp3 (no -an)', () => {
+  const frag = build(
+    [{ kind: 'mute', label: 'mute' }, { kind: 'audioOut', label: 'mp3', outKind: 'mp3' }],
+    META, null,
+  )
+  assert.equal(frag.output, 'mp3')
+  assert.equal(frag.extraArgs.includes('-an'), false)
+})
+
+test('build: mute stays intact for mp4 output', () => {
+  const frag = build([{ kind: 'mute', label: 'mute' }], META, null)
+  assert.equal(frag.output, 'mp4')
+  assert.deepEqual(frag.extraArgs, ['-an'])
+})
+
 test('build: gif builds a palette filter graph', () => {
   const frag = build([{ kind: 'gif', label: 'gif', fps: 12, width: 480 }], META, null)
   assert.equal(frag.output, 'gif')
