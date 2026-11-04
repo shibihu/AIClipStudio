@@ -7,5 +7,8 @@
     "start": "node server.js",
     "test": "node --test test/engine.test.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "license": "MIT"
 }

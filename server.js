@@ -57,6 +57,7 @@ try {
 
 function findFont() {
   const candidates = [
+    path.join(ROOT, 'vendor', 'fonts', 'DejaVuSans-Bold.ttf'),
     '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
     '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
     '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
@@ -651,8 +652,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     // auth gate: api + media require a token when AUTH_TOKEN is configured
-    // (/api/auth is exempt — it's how you obtain the session in the first place)
-    if (AUTH_TOKEN && !authorized(req, url) && p !== '/api/auth') {
+    // (/api/auth is exempt — it's how you obtain the session in the first place,
+    //  /api/health is exempt — it powers uptime/health checks like Render's)
+    if (AUTH_TOKEN && !authorized(req, url) && p !== '/api/auth' && p !== '/api/health') {
       if (p.startsWith('/api/')) return json(res, 401, { error: 'auth required' })
       if (p.startsWith('/media/')) return send(res, 401, 'auth required')
     }
