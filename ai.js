@@ -37,18 +37,6 @@ function atempoChain(rate) {
   return stages
 }
 
-function drawtextEscape(text) {
-  return String(text)
-    .replace(/\\/g, '\\\\\\\\')
-    .replace(/:/g, '\\\\:')
-    .replace(/'/g, "\\\\\\'")
-    .replace(/%/g, '\\\\\\%')
-    .replace(/"/g, '')
-    .trim()
-}
-
-// ---------------------------------------------------------------------------
-
 // Returns { ops:[...], unknown:{bool}, clarify:{bool}, summary:string }
 function understand(message, meta) {
   const s = (message || '').toLowerCase().trim()
@@ -62,7 +50,13 @@ function understand(message, meta) {
   const firstCut = s.match(/(?:remove|delete|cut|trim|drop)\s+(?:the\s+)?first\s+(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|second)/)
   const lastCut = s.match(/(?:remove|delete|cut|trim|drop)\s+(?:the\s+)?last\s+(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|second)/)
   const firstHalf = s.match(/(?:remove|delete|cut|drop)\s+(?:the\s+)?(?:first|1st)\s+half/)
-  const shorten = s.match(/(?:shorter|shorten).{0,30}?(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|second)/)
+  // "shorten to 10s" names a target length; "5 seconds shorter" / "shorter by 5s"
+  // name a delta to subtract from the current duration
+  const shortenTo = s.match(/(?:short(?:er)?|shorten|shrink)\b.{0,30}\bto\b\s+(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|seconds?)?/)
+  const shortenBy = s.match(/(?:short(?:er)?|shorten|shrink)\b.{0,15}\bby\s+(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|seconds?)?/)
+  const shortenMinus = s.match(/(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|seconds?)?\s*short(?:er)?\b/)
+  // legacy fallback: "shorten 10s" style (assumed to mean a target length)
+  const shorten = s.match(/(?:short(?:er)?|shorten)\b.{0,30}?(\d+(?:[.,]\d+)?)\s*(?:s\b|sec|secs|second)/)
 
   if (keepRng) {
     const a = secs(keepRng[1]) ?? 0
@@ -79,25 +73,39 @@ function understand(message, meta) {
   } else if (firstHalf) {
     ops.push({ kind: 'trim', label: 'cut the first half', to: (meta.duration || 0) / 2 })
     trimmed = true
+  } else if (shortenTo) {
+    ops.push({ kind: 'trim', label: `keep only the first ${shortenTo[1]}s`, to: parseFloat(shortenTo[1].replace(',', '.')) })
+    trimmed = true
+  } else if ((shortenBy || shortenMinus) && typeof meta.duration === 'number') {
+    const d = parseFloat((shortenBy ? shortenBy[1] : shortenMinus[1]).replace(',', '.'))
+    ops.push({ kind: 'trim', label: `make it ${d}s shorter`, to: Math.max(0.1, meta.duration - d) })
+    trimmed = true
   } else if (shorten) {
     ops.push({ kind: 'trim', label: `keep only the first ${shorten[1]}s`, to: parseFloat(shorten[1].replace(',', '.')) })
     trimmed = true
   }
 
   // ---- speed ----
-  // "louder 2x"/"volume 2x" are audio intents — don't let the bare "2x" grab them
+  // "louder 2x"/"volume 2x" are audio intents — don't let the bare "2x" grab them.
+  // Slow intent wins over a bare "Nx" fast path, otherwise "slower 2x" would
+  // speed the clip up instead of slowing it down.
   const audioIntent = /(louder|quieter|volume|audio|sound)/.test(s)
-  const rateM = audioIntent ? null
+  const slowIntent = /\bslow/.test(s)
+  const rateM = audioIntent && !slowIntent ? null
     : s.match(/(\d+(?:[.,]\d+)?)\s*(?:x|×|times)\b/) || s.match(/speed\s*(?:it\s*)?(?:up|down)?\s*(?:by\s*)?(\d+(?:[.,]\d+)?)/)
-  if (rateM && /(speed|fast|slow|x|×|times)/.test(s)) {
+  if (slowIntent) {
+    const slowM = audioIntent ? null : s.match(/(\d+(?:[.,]\d+)?)\s*(?:x|×|times)/)
+    const explicitRate = slowM ? parseFloat(slowM[1].replace(',', '.')) : null
+    const isExplicit = explicitRate && explicitRate !== 1
+    const rate = isExplicit ? 1 / explicitRate : 0.5
+    // "2x slower" is easier to read than "0.5× slow motion"
+    const label = isExplicit ? `${explicitRate}× slower` : `${rate}× slow motion`
+    ops.push({ kind: 'speed', label, vf: `setpts=PTS*${(1 / rate).toFixed(3)}`, af: `atempo=${atempoChain(rate).join(',atempo=')}` })
+  } else if (rateM && /(speed|fast|slow|x|×|times)/.test(s)) {
     const rate = parseFloat(rateM[1].replace(',', '.'))
     if (rate && rate > 1) {
       ops.push({ kind: 'speed', label: `${rate}× speed`, vf: `setpts=PTS/${rate}`, af: `atempo=${atempoChain(rate).join(',atempo=')}` })
     }
-  } else if (/slow/.test(s)) {
-    let rate = num(s.match(/(\d+(?:[.,]\d+)?)\s*(?:x|×|times)/)) || 0.5
-    if (rate > 1) rate = 1 / rate
-    ops.push({ kind: 'speed', label: `${rate}× slow motion`, vf: `setpts=PTS*${(1 / rate).toFixed(3)}`, af: `atempo=${atempoChain(rate).join(',atempo=')}` })
   }
 
   // ---- audio ----
@@ -127,7 +135,8 @@ function understand(message, meta) {
   }
 
   // ---- crop / aspect ----
-  const wantVertical = /(tiktok|short|reels|instagram|vertical)/.test(s)
+  // word boundaries: "make it shorter" must NOT match "short" (→ 9:16 crop)
+  const wantVertical = /\b(?:tiktok|shorts?|reels?|instagram|vertical)\b/.test(s)
   const arRaw = s.match(/\b(1:1|9:16|16:9|4:5|4:3|21:9)\b/) || (/(square)/.test(s) ? ['1:1'] : null)
   if (arRaw || wantVertical) {
     const arStr = arRaw ? (arRaw[1] || arRaw[0]) : '9:16'
@@ -171,7 +180,6 @@ function understand(message, meta) {
   const blurM = s.match(/blur(?:\s*(?:it|everything|the (?:whole )?video))?(?:\s*(?:by|of|radius)\s*(\d+))?/)
   if (blurM) ops.push({ kind: 'blur', label: `blur (radius ${blurM[1] || 4})`, vf: `boxblur=${Math.min(20, parseInt(blurM[1] || '4', 10))}` })
 
-  // ---- text overlay ----
   // ---- text overlay ----
   if (/(text|title|caption|watermark|subtitle|write|overlay)/.test(s)) {
     const orig = (message || '').trim()
@@ -309,7 +317,9 @@ function makeTextOverlay(ops, meta, dir, duration) {
     if (op.kind !== 'text') continue
     const size = Math.min(Math.max(18, op.size || 40), h * 0.9)
     const pos = op.pos || 'center'
-    const name = `overlay-${++i}.ass`
+    // unique name per file: two concurrent edits on the same job must not
+    // overwrite each other's overlay
+    const name = `overlay-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}-${++i}.ass`
     const end = (pos === 'center') ? 36000 : (duration || 36000) // top/bottom: as long as possible pairs with trim
     const ass = `[Script Info]
 ScriptType: v4.00+
@@ -548,8 +558,27 @@ const PROVIDERS = [
   },
 ]
 
+// an LLM op is rejected early when required fields are missing/implausible —
+// otherwise it can pass through as a silent no-op ("Rendering: speed ⏳")
+function validOp(o, hasAudio) {
+  const F = (x) => Number.isFinite(+x)
+  switch (o.kind) {
+    case 'speed': return F(o.rate) && +o.rate > 0 && +o.rate !== 1 && +o.rate < 100
+    case 'volume': return F(o.factor) && +o.factor > 0 && +o.factor !== 1 && +o.factor <= 100
+    case 'fps': return F(o.value) && +o.value > 0 && +o.value <= 240
+    case 'rotate': return [90, 180, 270, -90, -180, -270].includes(Math.round(+o.deg || 0))
+    case 'scale': return F(o.height) && +o.height > 0 && +o.height <= 8640
+    case 'aspect': return F(o.rx) && F(o.ry) && +o.rx > 0 && +o.ry > 0
+    case 'text': return String(o.text || '').trim().length > 0
+    case 'gif': return o.fps == null || +o.fps > 0 // clamped further in the loop
+    case 'afilter': return hasAudio // nothing to filter on a muted/video-only clip
+    default: return true // trim/mute/eq/filter/etc. are validated (or dropped) in the loop below
+  }
+}
+
 function normalizeOps(parsed, mediaInfo) {
-  const ops = (parsed.ops || []).filter((o) => o && ALLOWED_KINDS.has(o.kind))
+  const hasAudio = mediaInfo && mediaInfo.hasAudio !== false
+  const ops = (parsed.ops || []).filter((o) => o && ALLOWED_KINDS.has(o.kind) && validOp(o, hasAudio))
   const chatOps = ops.filter((o) => o.kind === 'chat')
   if (chatOps.length && !ops.some((o) => o.kind !== 'chat')) {
     const reply = String(chatOps[0].reply || '').trim()
@@ -561,8 +590,10 @@ function normalizeOps(parsed, mediaInfo) {
   usable.forEach((o) => {
     const label = o.label || o.kind
     if (o.kind === 'rotate') {
-      o.vf = o.deg === 90 ? 'transpose=1' : o.deg === 270 ? 'transpose=2' : 'transpose=1,transpose=1'
-      o.label = `rotate ${o.deg}°`
+      let d = Math.round(+o.deg || 0)
+      if (d < 0) d += 360
+      o.vf = d === 90 ? 'transpose=1' : d === 270 ? 'transpose=2' : 'transpose=1,transpose=1'
+      o.label = `rotate ${d}°`
     } else if (o.kind === 'speed' && o.rate > 1) {
       o.vf = `setpts=PTS/${o.rate}`
       o.af = `atempo=${atempoChain(o.rate).join(',atempo=')}`
@@ -578,10 +609,10 @@ function normalizeOps(parsed, mediaInfo) {
     else if (o.kind === 'mirror') o.label = 'mirror'
     else if (o.kind === 'vflip') o.label = 'flip vertically'
     else if (o.kind === 'gray') { o.vf = 'hue=s=0'; o.label = 'black & white' }
-    else if (o.kind === 'blur') { o.vf = `boxblur=${o.radius || 4}`; o.label = `blur ${o.radius || 4}` }
-    else if (o.kind === 'gif') { o.outKind = 'gif'; o.fps = o.fps || 12; o.width = o.width || 480; o.label = `GIF @ ${o.fps}fps` }
+    else if (o.kind === 'blur') { const r = Math.max(1, Math.min(20, Math.round(+o.radius) || 4)); o.vf = `boxblur=${r}`; o.label = `blur ${r}` }
+    else if (o.kind === 'gif') { o.outKind = 'gif'; o.fps = Math.max(1, Math.min(60, Math.round(+o.fps) || 12)); o.width = Math.max(32, Math.min(1280, Math.round(+o.width) || 480)); o.label = `GIF @ ${o.fps}fps` }
     else if (o.kind === 'audioOut') { o.outKind = 'mp3'; o.label = 'export audio mp3' }
-    else if (o.kind === 'text') { o.pos = ['top', 'center', 'bottom'].includes(o.pos) ? o.pos : 'center'; o.text = String(o.text || '').slice(0, 120); o.size = Math.min(Math.max(12, +o.size || 40), 200); o.label = `text "${(o.text || '').slice(0, 30)}" (${o.pos})` }
+    else if (o.kind === 'text') { o.pos = ['top', 'center', 'bottom'].includes(o.pos) ? o.pos : 'center'; o.text = String(o.text || '').trim().slice(0, 120); o.size = Math.min(Math.max(12, +o.size || 40), 200); o.label = `text "${(o.text || '').slice(0, 30)}" (${o.pos})` }
     else if (o.kind === 'trim') { o.from = o.from != null ? Math.max(0, +o.from || 0) : null; o.to = o.to != null && typeof mediaInfo.duration === 'number' ? Math.min(mediaInfo.duration, Math.max(0.1, +o.to || 0)) : (o.to != null ? Math.max(0.1, +o.to || 0) : null); o.label = o.label || `trim ${(o.from ?? 0)}s → ${o.to == null ? 'end' : o.to + 's'}` }
     else if (o.kind === 'volume') { o.label = `volume ${o.factor > 1 ? 'up' : 'down'}`; if (o.factor) o.af = `volume=${o.factor}` }
     else if (o.kind === 'fps') { o.label = `${o.value} fps`; if (o.value) o.vf = `fps=${o.value}` }

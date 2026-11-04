@@ -860,7 +860,9 @@ const server = http.createServer(async (req, res) => {
       if (VISION_RE.test(message) && (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY)) {
         frames = await extractFrames(path.join(JOBS, id), src, srcName)
       }
-      let result = await understandWithLLM(message, meta, job.msgs.concat([{ role: 'user', content: message }]), frames)
+      // pass job.msgs as-is: understandWithLLM appends the current user message
+      // itself (passing concat here would send the message to the model twice)
+      let result = await understandWithLLM(message, meta, job.msgs, frames)
 
       // LLM chose a conversational answer (question / advice / chit-chat)
       if (result && result.isChat) {

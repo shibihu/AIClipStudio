@@ -128,6 +128,48 @@ test('understand: empty message', () => {
   assert.equal(understand('', META).unknown, true)
 })
 
+// --- regressions: "shorter"/"slow" wording must not trigger unrelated ops ------
+
+test('understand: "make it shorter" no longer crops to 9:16', () => {
+  const r = understand('make the video shorter', META)
+  assert.equal(r.ops.find((o) => o.kind === 'aspect'), undefined)
+})
+
+test('understand: "make it 5 seconds shorter" trims 5s off the end', () => {
+  const r = understand('make it 5 seconds shorter', META)
+  assert.deepEqual(r.ops.map((o) => o.kind), ['trim'])
+  assert.equal(r.ops[0].to, 15)
+})
+
+test('understand: "shorter by 5" trims 5s off too', () => {
+  const r = understand('make the clip shorter by 5', META)
+  assert.deepEqual(r.ops.map((o) => o.kind), ['trim'])
+  assert.equal(r.ops[0].to, 15)
+})
+
+test('understand: "shorten the clip to 10 seconds" keeps the first 10s', () => {
+  const r = understand('shorten the clip to 10 seconds', META)
+  assert.deepEqual(r.ops.map((o) => o.kind), ['trim'])
+  assert.equal(r.ops[0].to, 10)
+})
+
+test('understand: explicit vertical intent still crops (regression)', () => {
+  assert.equal(understand('9:16 for tiktok', META).ops[0].rx, 9)
+  assert.equal(understand('make a youtube short version', META).ops[0].ry, 16)
+})
+
+test('understand: "slower 2x" slows down instead of speeding up', () => {
+  const r = understand('slower 2x please', META)
+  assert.equal(r.ops[0].kind, 'speed')
+  assert.equal(r.ops[0].vf, 'setpts=PTS*2.000')
+  assert.equal(r.ops[0].af, 'atempo=0.5')
+})
+
+test('understand: "2x speed" still speeds up (regression)', () => {
+  const r = understand('2x speed', META)
+  assert.equal(r.ops[0].vf, 'setpts=PTS/2')
+})
+
 // --- build(): op list → ffmpeg fragments ---------------------------------------
 
 test('build: bare trim becomes fast-seek (no filter graph)', () => {
@@ -259,6 +301,42 @@ test('normalizeOps: text normalised (pos whitelist, size clamp)', () => {
   const r = normalizeOps({ ops: [{ kind: 'text', text: 'HI', pos: 'sideways', size: 99999 }] }, META)
   assert.equal(r.ops[0].pos, 'center')
   assert.equal(r.ops[0].size, 200)
+})
+
+test('normalizeOps: ops with missing/invalid required fields are dropped entirely', () => {
+  const r = normalizeOps({
+    ops: [
+      { kind: 'speed' },              // no rate
+      { kind: 'speed', rate: 1 },     // 1× is a no-op
+      { kind: 'volume' },             // no factor
+      { kind: 'volume', factor: 0 },
+      { kind: 'fps' },                // no value
+      { kind: 'text', text: '   ' },  // empty text
+      { kind: 'rotate', deg: 45 },    // unsupported angle
+      { kind: 'scale', height: -3 },
+      { kind: 'gif', fps: -2 },
+    ],
+  }, META)
+  assert.equal(r, null)
+})
+
+test('normalizeOps: valid mixed ops survive validation', () => {
+  const r = normalizeOps({ ops: [{ kind: 'speed', rate: 2 }, { kind: 'text', text: 'hi' }, { kind: 'rotate', deg: -90 }] }, META)
+  assert.equal(r.ops.length, 3)
+  assert.equal(r.ops[2].vf, 'transpose=2')
+})
+
+test('normalizeOps: afilter kept on audio clips, dropped on video-only', () => {
+  const r = normalizeOps({ ops: [{ kind: 'afilter', af: 'bass=g=8' }] }, META)
+  assert.equal(r.ops[0].af, 'bass=g=8')
+  assert.equal(normalizeOps({ ops: [{ kind: 'afilter', af: 'bass=g=8' }] }, { ...META, hasAudio: false }), null)
+})
+
+test('normalizeOps: gif + blur normalised/clamped', () => {
+  const r = normalizeOps({ ops: [{ kind: 'gif', fps: 500, width: 99999 }, { kind: 'blur', radius: 999 }] }, META)
+  assert.equal(r.ops[0].fps, 60)
+  assert.equal(r.ops[0].width, 1280)
+  assert.equal(r.ops[1].vf, 'boxblur=20')
 })
 
 // --- extractJson ----------------------------------------------------------------
