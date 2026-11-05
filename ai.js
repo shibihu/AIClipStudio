@@ -486,26 +486,38 @@ function partsOf(content) {
   return (content || []).map((p) => (p.type === 'image' ? { type: 'image', mime: p.mime, data: p.data } : { type: 'text', text: p.text }))
 }
 
+// gemini-2.5-flash was retired for new API keys; use the rolling "latest"
+// aliases + a lighter fallback when the primary model is overloaded (503)
+const GEMINI_PRIMARY = process.env.GEMINI_MODEL || 'gemini-flash-latest'
+const GEMINI_FALLBACK = process.env.GEMINI_FALLBACK || 'gemini-flash-lite-latest'
+const geminiModels = () => (GEMINI_PRIMARY === GEMINI_FALLBACK ? [GEMINI_PRIMARY] : [GEMINI_PRIMARY, GEMINI_FALLBACK])
+
 const PROVIDERS = [
   {
     name: 'gemini',
     key: () => process.env.GEMINI_API_KEY,
-    model: () => process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    model: () => GEMINI_PRIMARY,
     async call(system, msgs, model) {
-      return withRetry(async () => {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.key())}`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: { role: 'user', parts: [{ text: system }] },
-            contents: [...msgs.map((m) => toGemini(m.content)), { role: 'user', parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] }],
-            generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
-          }),
-        })
-        if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
-        const j = await r.json()
-        return j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || null
-      })
+      let last
+      for (const m of geminiModels()) {
+        try {
+          return await withRetry(async () => {
+            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(this.key())}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                systemInstruction: { role: 'user', parts: [{ text: system }] },
+                contents: [...msgs.map((m2) => toGemini(m2.content)), { role: 'user', parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] }],
+                generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+              }),
+            })
+            if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
+            const j = await r.json()
+            return j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || null
+          })
+        } catch (e) { last = e }
+      }
+      throw last
     },
   },
   {
@@ -750,30 +762,37 @@ Rules:
 async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) {
   const p = activeProvider()
   if (!p || p.name !== 'gemini') return null
-  const model = p.model()
   try {
     const buf = await fs.promises.readFile(audioPath)
     if (buf.length > maxBytes) { console.error('[ai] STT: audio too large', buf.length); return null }
-    const raw = await withRetry(async () => {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(p.key())}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { role: 'user', parts: [{ text: 'You transcribe audio and answer ONLY with the JSON object.' }] },
-          contents: [{
-            role: 'user',
-            parts: [
-              { inline_data: { mime_type: 'audio/mpeg', data: buf.toString('base64') } },
-              { text: STT_PROMPT },
-            ],
-          }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
-        }),
-      })
-      if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
-      const j = await r.json()
-      return j.candidates?.[0]?.content?.parts?.map((x) => x.text || '').join('') || null
-    })
+    let raw = null
+    let lastErr = null
+    for (const model of geminiModels()) {
+      try {
+        raw = await withRetry(async () => {
+          const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(p.key())}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: { role: 'user', parts: [{ text: 'You transcribe audio and answer ONLY with the JSON object.' }] },
+              contents: [{
+                role: 'user',
+                parts: [
+                  { inline_data: { mime_type: 'audio/mpeg', data: buf.toString('base64') } },
+                  { text: STT_PROMPT },
+                ],
+              }],
+              generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
+            }),
+          })
+          if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
+          const j = await r.json()
+          return j.candidates?.[0]?.content?.parts?.map((x) => x.text || '').join('') || null
+        })
+        if (raw) break
+      } catch (e) { lastErr = e }
+    }
+    if (!raw && lastErr) throw lastErr
     noteLlmOk(p.name)
     if (!raw) return null
     const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
