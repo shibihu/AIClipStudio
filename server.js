@@ -25,6 +25,10 @@
 }
 
 const http = require('http')
+
+// prefer IPv4 A-records when a host has both: on IPv6-broken networks those
+// connections silently blackhole and stall every LLM call for minutes
+require('dns').setDefaultResultOrder('ipv4first')
 const fs = require('fs')
 const fsp = require('fs/promises')
 const path = require('path')
@@ -645,6 +649,17 @@ function authorized(req, url) {
   return url.searchParams.get('auth') === AUTH_TOKEN
 }
 
+// visible signal when an edit/chat got answered by the offline engine because
+// the LLM just failed (timeout / overloaded / unreachable) — otherwise it looks
+// like the AI silently degraded with no explanation
+function llmFallbackNote(now = Date.now()) {
+  const h = getLlmHealth()
+  if (!h.aiKey || h.reachable !== false) return ''
+  if (!h.lastErrorAt || now - h.lastErrorAt > 2 * 60 * 1000) return ''
+  const detail = h.lastError ? ` (${String(h.lastError).slice(0, 140)})` : ''
+  return `\n\nℹ️ The AI service seems unreachable${detail} — this answer came from the built-in offline engine, so more exotic requests may not be understood right now.`
+}
+
 // --- rate limiting: small sliding-window buckets per ip+route -----------------
 const RATE_RULES = [
   { match: /^\/api\/auth$/, max: 6, windowMs: 60000 },
@@ -905,7 +920,7 @@ const server = http.createServer(async (req, res) => {
         if (!result.ops.length) unresolved = true
       }
       if (unresolved) {
-        const reply = "I couldn't map that to an edit I know yet. Try rephrasing — e.g. \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\" — or ask \"what can you do?\""
+        const reply = "I couldn't map that to an edit I know yet. Try rephrasing — e.g. \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\" — or ask \"what can you do?\"" + llmFallbackNote()
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
       }
@@ -931,7 +946,7 @@ const server = http.createServer(async (req, res) => {
       const { rid } = await enqueueRender(job, id, srcName, frag, result, meta, message)
       const summary = result.summary || frag.desc.join(' + ')
       const queued = renderQueue.length
-      const reply = `${result.isLLM ? '🤖 (LLM) ' : '🛠 '}Rendering: ${summary} ⏳ (${queued ? `queued — ${queued} render${queued === 1 ? '' : 's'} ahead` : 'starting now'})`
+      const reply = `${result.isLLM ? '🤖 (LLM) ' : '🛠 '}Rendering: ${summary} ⏳ (${queued ? `queued — ${queued} render${queued === 1 ? '' : 's'} ahead` : 'starting now'})` + (result.isLLM ? '' : llmFallbackNote())
       return json(res, 200, {
         reply,
         summary,

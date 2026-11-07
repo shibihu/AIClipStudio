@@ -433,6 +433,11 @@ const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'm
 // (c) retry with exponential backoff on 429/5xx, (d) health reporting used by
 // /api/health so the UI can show an "LLM unreachable" badge.
 
+// per-request HTTP budget for LLM calls: a hung/stalled connection (bad route,
+// IPv6 blackhole, proxy issues) fails in this window instead of Node fetch's
+// ~5min default — 45s is enough for text+vision JSON answers. Override via env.
+const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS) || 45000
+
 const llmHealth = {
   reachable: null,            // null = never called; true = last call ok
   lastError: null,            // last error message
@@ -461,8 +466,10 @@ function noteLlmError(provider, e) {
   llmHealth.lastErrorAt = Date.now()
 }
 
-// retry transient failures (429 rate-limit / 5xx server errors) with backoff
-async function withRetry(fn, { attempts = 3, baseMs = 1500 } = {}) {
+// retry transient failures (429 rate-limit / 5xx server errors) with backoff.
+// 2 attempts × short backoff keeps the worst case per model ≈ 2 × LLM_TIMEOUT_MS;
+// the Gemini provider already rotates to a fallback model after each throw.
+async function withRetry(fn, { attempts = 2, baseMs = 1000 } = {}) {
   let last
   for (let i = 0; i < attempts; i++) {
     try { return await fn() } catch (e) {
@@ -504,6 +511,7 @@ const PROVIDERS = [
           return await withRetry(async () => {
             const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(this.key())}`, {
               method: 'POST',
+              signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({
                 systemInstruction: { role: 'user', parts: [{ text: system }] },
@@ -534,6 +542,7 @@ const PROVIDERS = [
         }
         const r = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
+          signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
           headers: { 'content-type': 'application/json', authorization: `Bearer ${this.key()}` },
           body: JSON.stringify({
             model,
@@ -561,6 +570,7 @@ const PROVIDERS = [
         }
         const r = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
+          signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
           headers: { 'content-type': 'application/json', 'x-api-key': this.key(), 'anthropic-version': '2023-06-01' },
           body: JSON.stringify({ model, max_tokens: 2048, system, messages: msgs.map(toMsg) }),
         })
