@@ -14,12 +14,25 @@
 // ---------------------------------------------------------------------------
 
 // --- load .env (key-value lines) — never committed --------------------------
+// Handles CRLF, a UTF-8 BOM, `export KEY=...`, quoted values and trailing
+// `# comments` — a stray quote or comment used to silently corrupt the key.
 {
   const envPath = __dirname + '/.env'
   try {
-    for (const line of require('fs').readFileSync(envPath, 'utf8').split('\n')) {
-      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/)
-      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
+    const raw = require('fs').readFileSync(envPath, 'utf8').replace(/^\uFEFF/, '')
+    for (let line of raw.split(/\r?\n/)) {
+      line = line.trim()
+      if (!line || line.startsWith('#')) continue
+      line = line.replace(/^export\s+/, '')
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+      if (!m) continue
+      let val = m[2].trim()
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1)
+      } else {
+        val = val.replace(/\s+#.*$/, '').trim()
+      }
+      if (process.env[m[1]] === undefined) process.env[m[1]] = val
     }
   } catch { /* no .env — fine */ }
 }
@@ -37,7 +50,7 @@ const crypto = require('crypto')
 const { execFile, spawn } = require('child_process')
 const {
   understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
-  buildCues, placeCues, transcribeAudio, normalizeTranscriptCues, getLlmHealth,
+  buildCues, placeCues, transcribeAudio, normalizeTranscriptCues, getLlmHealth, getLlmInfo,
 } = require('./ai')
 
 const ROOT = __dirname
@@ -102,6 +115,14 @@ execFile(FFMPEG, ['-version'], { timeout: 15000 }, (err, stdout) => {
   console.log(err ? `[ai-studio] ffmpeg check FAILED: ${err.message}` : `[ai-studio] ffmpeg OK — ${String(stdout).split('\n')[0]}`)
 })
 console.log(`[ai-studio] ffmpeg: ${FFMPEG}${FONT ? ` | font: ${FONT}` : ' | font: none (text overlays need fontconfig/default font)'}`)
+
+// make it obvious at boot whether the AI brain (LLM key) is actually wired up
+const AI_INFO = getLlmInfo()
+if (AI_INFO) {
+  console.log(`[ai-studio] AI brain: ${AI_INFO.provider} (${AI_INFO.model})${AI_INFO.vision ? ' + vision' : ''}`)
+} else {
+  console.warn('[ai-studio] ⚠ no LLM key found — free-form requests will use the limited offline engine. Put GEMINI_API_KEY (or OPENAI_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY / OPENCODE_API_KEY / ANTHROPIC_API_KEY) in .env or the environment.')
+}
 
 // --- helpers -----------------------------------------------------------------
 
@@ -654,10 +675,16 @@ function authorized(req, url) {
 // like the AI silently degraded with no explanation
 function llmFallbackNote(now = Date.now()) {
   const h = getLlmHealth()
-  if (!h.aiKey || h.reachable !== false) return ''
-  if (!h.lastErrorAt || now - h.lastErrorAt > 2 * 60 * 1000) return ''
-  const detail = h.lastError ? ` (${String(h.lastError).slice(0, 140)})` : ''
-  return `\n\nℹ️ The AI service seems unreachable${detail} — this answer came from the built-in offline engine, so more exotic requests may not be understood right now.`
+  if (!h.aiKey) {
+    return '\n\nℹ️ No AI key is configured, so this was handled by the built-in offline engine (limited). Add GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, OPENCODE_API_KEY (or OPENAI_API_KEY / ANTHROPIC_API_KEY) to .env or the environment and restart to unlock free-form editing.'
+  }
+  if (h.reachable === true) return ''
+  if (!h.lastErrorAt) {
+    return '\n\nℹ️ The AI key is set but the model has not answered yet — the offline engine handled this. Check the server log for the LLM error.'
+  }
+  if (now - h.lastErrorAt > 2 * 60 * 1000) return ''
+  const detail = h.lastError ? ` (${String(h.lastError).slice(0, 200)})` : ''
+  return `\n\nℹ️ The AI service call failed${detail}. This answer came from the built-in offline engine, so more exotic requests may not be understood. Check the configured key and its model override, then restart.`
 }
 
 // --- rate limiting: small sliding-window buckets per ip+route -----------------
@@ -769,7 +796,8 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/health') {
       return json(res, 200, {
         ok: true, ffmpeg: FFMPEG, ffmpegOk: FFMPEG_OK,
-        aiKey: !!(process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY),
+        aiKey: getLlmHealth().aiKey,
+        ai: getLlmInfo(),
         llm: getLlmHealth(),
         auth: !!AUTH_TOKEN,
         renders: { active: activeRuns, queued: renderQueue.length, concurrency: RENDER_CONCURRENCY },
@@ -900,7 +928,7 @@ const server = http.createServer(async (req, res) => {
       // When the message smells like a suggestion/advice question AND we have
       // an LLM, sample frames so the model can actually see the clip.
       let frames = null
-      if (VISION_RE.test(message) && (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY)) {
+      if (VISION_RE.test(message) && AI_INFO?.vision) {
         frames = await extractFrames(path.join(JOBS, id), src, srcName)
       }
       // pass job.msgs as-is: understandWithLLM appends the current user message
@@ -920,7 +948,7 @@ const server = http.createServer(async (req, res) => {
         if (!result.ops.length) unresolved = true
       }
       if (unresolved) {
-        const reply = "I couldn't map that to an edit I know yet. Try rephrasing — e.g. \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\" — or ask \"what can you do?\"" + llmFallbackNote()
+        const reply = "I couldn't turn that into an edit yet. Try phrasing it as an action — e.g. \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\" — or ask \"what can you do?\"" + llmFallbackNote()
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
       }

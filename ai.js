@@ -1,8 +1,10 @@
 // ---------------------------------------------------------------------------
 // ai.js — the "AI brain": turns natural-language edit requests into ffmpeg ops
-// Works fully offline (rule-based intent engine). If OPENAI_API_KEY or
-// ANTHROPIC_API_KEY is set, it asks the LLM to translate the request into the
-// same JSON op list, and falls back to the local engine on any error.
+// Works fully offline (rule-based intent engine). If any LLM key is set
+// (GEMINI_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY,
+// OPENCODE_API_KEY or ANTHROPIC_API_KEY), it asks that LLM to translate the
+// request into the same JSON op list, and falls back to the local engine on
+// any error.
 // ---------------------------------------------------------------------------
 
 function num(str) {
@@ -453,6 +455,12 @@ function activeProvider() {
   return null
 }
 
+// which provider/model the key environment selects (no key material exposed)
+function getLlmInfo() {
+  const p = activeProvider()
+  return p ? { provider: p.name, model: p.model(), vision: !!p.vision } : null
+}
+
 function noteLlmOk(provider) {
   llmHealth.reachable = true
   llmHealth.lastError = null
@@ -482,10 +490,13 @@ async function withRetry(fn, { attempts = 2, baseMs = 1000 } = {}) {
 }
 
 // typed content → provider-specific message bodies
-function toGemini(content) {
-  return { role: 'user', parts: partsOf(content).map((p) => p.type === 'image'
-    ? { inline_data: { mime_type: p.mime, data: p.data } }
-    : { text: p.text }) }
+function toGemini(content, role = 'user') {
+  return {
+    role: role === 'assistant' ? 'model' : 'user',
+    parts: partsOf(content).map((p) => p.type === 'image'
+      ? { inline_data: { mime_type: p.mime, data: p.data } }
+      : { text: p.text }),
+  }
 }
 
 function partsOf(content) {
@@ -493,17 +504,80 @@ function partsOf(content) {
   return (content || []).map((p) => (p.type === 'image' ? { type: 'image', mime: p.mime, data: p.data } : { type: 'text', text: p.text }))
 }
 
-// gemini-2.5-flash was retired for new API keys; use the rolling "latest"
-// aliases + a lighter fallback when the primary model is overloaded (503)
-const GEMINI_PRIMARY = process.env.GEMINI_MODEL || 'gemini-flash-latest'
-const GEMINI_FALLBACK = process.env.GEMINI_FALLBACK || 'gemini-flash-lite-latest'
-const geminiModels = () => (GEMINI_PRIMARY === GEMINI_FALLBACK ? [GEMINI_PRIMARY] : [GEMINI_PRIMARY, GEMINI_FALLBACK])
+// Older models (e.g. gemini-2.5-flash) were retired for new API keys; the
+// rolling "latest" aliases always point at a model the key can access. Users
+// may override with GEMINI_MODEL / GEMINI_FALLBACK (comma-separated lists work).
+const GEMINI_PRIMARY = (process.env.GEMINI_MODEL || '').trim() || 'gemini-flash-latest'
+const GEMINI_FALLBACK = (process.env.GEMINI_FALLBACK || '').trim() || 'gemini-flash-lite-latest'
+// rolling aliases first, then explicit stable names in case an alias is not
+// exposed to a particular key/region (404) — all fail fast when unavailable
+const GEMINI_DEFAULTS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.8-flash', 'gemini-3.5-flash-lite']
+const geminiModels = () => [...new Set(
+  `${GEMINI_PRIMARY},${GEMINI_FALLBACK},${GEMINI_DEFAULTS.join(',')}`
+    .split(/[,\s]+/).map((s) => s.trim()).filter(Boolean)
+)]
+
+// pull the text out of a Gemini response, turning "no usable answer" into a
+// descriptive error instead of a silent null (which looked like a dead key)
+function geminiText(j, model) {
+  const cand = j?.candidates?.[0]
+  const parts = cand?.content?.parts || []
+  const text = parts.filter((p) => !p.thought).map((p) => p.text || '').join('').trim()
+  const block = j?.promptFeedback?.blockReason
+  const finish = cand?.finishReason
+  if (block) throw new Error(`${model}: blocked (${block})`)
+  if (finish === 'MAX_TOKENS') throw new Error(`${model}: output truncated (MAX_TOKENS) — raise maxOutputTokens`)
+  if (text) return text
+  if (finish && finish !== 'STOP') throw new Error(`${model}: no text (finishReason ${finish})`)
+  throw new Error(`${model}: empty response`)
+}
+
+// OpenAI-compatible chat-completions providers. OpenAI, OpenRouter, Groq and
+// OpenCode Zen (https://opencode.ai/zen/v1) all share this request/response
+// shape, so only the base URL, key, model and extra headers differ.
+function openAiCompatible({ name, key, model, url, headers = {}, jsonMode = false, vision = false }) {
+  return {
+    name,
+    key,
+    model,
+    vision,
+    async call(system, msgs, modelName) {
+      return withRetry(async () => {
+        const toMsg = (m) => {
+          const parts = partsOf(m.content).map((p) => p.type === 'image'
+            ? { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } }
+            : { type: 'text', text: p.text })
+          return { role: m.role, content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts }
+        }
+        const body = {
+          model: modelName,
+          temperature: 0.3,
+          max_tokens: 4096,
+          messages: [{ role: 'system', content: system }, ...msgs.map(toMsg), { role: 'user', content: 'Remember: answer ONLY with the JSON object.' }],
+        }
+        if (jsonMode) body.response_format = { type: 'json_object' }
+        const r = await fetch(url, {
+          method: 'POST',
+          signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.key()}`, ...headers },
+          body: JSON.stringify(body),
+        })
+        if (!r.ok) throw new Error(`${name} http ${r.status}: ${(await r.text()).slice(0, 300)}`)
+        const j = await r.json()
+        const text = j.choices?.[0]?.message?.content
+        if (!text) throw new Error(`${name}: empty response`)
+        return typeof text === 'string' ? text : JSON.stringify(text)
+      })
+    },
+  }
+}
 
 const PROVIDERS = [
   {
     name: 'gemini',
     key: () => process.env.GEMINI_API_KEY,
     model: () => GEMINI_PRIMARY,
+    vision: true,
     async call(system, msgs, model) {
       let last
       for (const m of geminiModels()) {
@@ -514,52 +588,65 @@ const PROVIDERS = [
               signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({
-                systemInstruction: { role: 'user', parts: [{ text: system }] },
-                contents: [...msgs.map((m2) => toGemini(m2.content)), { role: 'user', parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] }],
-                generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+                systemInstruction: { parts: [{ text: system }] },
+                contents: [
+                  ...msgs.map((m2) => toGemini(m2.content, m2.role)),
+                  { role: 'user', parts: [{ text: 'Remember: answer ONLY with the JSON object.' }] },
+                ],
+                generationConfig: {
+                  temperature: 0.3,
+                  // thinking models (Gemini 3+) spend part of this budget on
+                  // internal reasoning — 2048 used to truncate the JSON answer
+                  maxOutputTokens: 8192,
+                  responseMimeType: 'application/json',
+                },
               }),
             })
             if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
-            const j = await r.json()
-            return j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || null
+            return geminiText(await r.json(), m)
           })
         } catch (e) { last = e }
       }
       throw last
     },
   },
-  {
+  openAiCompatible({
     name: 'openai',
     key: () => process.env.OPENAI_API_KEY,
     model: () => process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    async call(system, msgs, model) {
-      return withRetry(async () => {
-        const toMsg = (m) => {
-          const parts = partsOf(m.content).map((p) => p.type === 'image'
-            ? { type: 'image_url', image_url: { url: `data:${p.mime};base64,${p.data}` } }
-            : { type: 'text', text: p.text })
-          return { role: m.role, content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts }
-        }
-        const r = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.key()}` },
-          body: JSON.stringify({
-            model,
-            response_format: { type: 'json_object' },
-            messages: [{ role: 'system', content: system }, ...msgs.map(toMsg), { role: 'user', content: 'Remember: answer ONLY with the JSON object.' }],
-          }),
-        })
-        if (!r.ok) throw new Error(`openai http ${r.status}`)
-        const j = await r.json()
-        return j.choices?.[0]?.message?.content || null
-      })
-    },
-  },
+    url: 'https://api.openai.com/v1/chat/completions',
+    jsonMode: true,
+    vision: true,
+  }),
+  openAiCompatible({
+    name: 'openrouter',
+    key: () => process.env.OPENROUTER_API_KEY,
+    model: () => process.env.OPENROUTER_MODEL || 'openrouter/auto',
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    headers: { 'HTTP-Referer': 'https://github.com/anomalyco/opencode', 'X-Title': 'AI Clip Studio' },
+    vision: true,
+  }),
+  openAiCompatible({
+    name: 'groq',
+    key: () => process.env.GROQ_API_KEY,
+    model: () => process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    jsonMode: true,
+    vision: false,
+  }),
+  openAiCompatible({
+    name: 'opencode',
+    key: () => process.env.OPENCODE_API_KEY,
+    model: () => process.env.OPENCODE_MODEL || 'deepseek-v4-flash',
+    url: 'https://opencode.ai/zen/v1/chat/completions',
+    jsonMode: false,
+    vision: false,
+  }),
   {
     name: 'anthropic',
     key: () => process.env.ANTHROPIC_API_KEY,
     model: () => process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022',
+    vision: true,
     async call(system, msgs, model) {
       return withRetry(async () => {
         const toMsg = (m) => {
@@ -572,7 +659,7 @@ const PROVIDERS = [
           method: 'POST',
           signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
           headers: { 'content-type': 'application/json', 'x-api-key': this.key(), 'anthropic-version': '2023-06-01' },
-          body: JSON.stringify({ model, max_tokens: 2048, system, messages: msgs.map(toMsg) }),
+          body: JSON.stringify({ model, max_tokens: 4096, system, messages: msgs.map(toMsg) }),
         })
         if (!r.ok) throw new Error(`anthropic http ${r.status}`)
         const j = await r.json()
@@ -670,7 +757,7 @@ async function understandWithLLM(message, meta, history, frames) {
   const p = activeProvider()
   if (!p) return null
   // attach vision frames to the final user message when provided
-  if (Array.isArray(frames) && frames.length && typeof p.call !== 'undefined') {
+  if (Array.isArray(frames) && frames.length && p.vision !== false && typeof p.call !== 'undefined') {
     const parts = frames.map((f) => ({ type: 'image', mime: f.mime || 'image/jpeg', data: f.data }))
     parts.push({ type: 'text', text: 'These images are the sample frames (in clip order). Use them if relevant.' })
     msgs[msgs.length - 1] = { role: 'user', content: typeof msgs[msgs.length - 1].content === 'string'
@@ -679,19 +766,27 @@ async function understandWithLLM(message, meta, history, frames) {
   }
   try {
     const raw = await p.call(system, msgs, p.model())
+    if (!raw) throw new Error(`${p.name}: empty response`)
     noteLlmOk(p.name)
-    if (!raw) return null
     const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
-    const parsed = JSON.parse(extractJson(cleaned))
+    let parsed
+    try {
+      parsed = JSON.parse(extractJson(cleaned))
+    } catch (e) {
+      // model replied with prose instead of JSON — answer conversationally
+      if (!/[{}]/.test(cleaned) && cleaned.length <= 1500) {
+        return { isChat: true, reply: cleaned, isLLM: true, summary: '' }
+      }
+      throw new Error(`${p.name}: could not parse JSON answer (${e.message})`)
+    }
     const nx = normalizeOps(parsed, meta)
     if (nx) {
       if (nx.isChat) return { isChat: true, reply: nx.reply, isLLM: true, summary: '' }
       return nx
     }
-    // model answered JSON but no usable ops — treat summary as a chat reply
-    if (parsed && parsed.summary && !Array.isArray(parsed.ops)) {
-      return { isChat: true, reply: String(parsed.summary), isLLM: true, summary: '' }
-    }
+    // model answered JSON but no usable ops — use its summary/reply if present
+    const chat = String(parsed?.summary || parsed?.reply || '').trim()
+    if (chat) return { isChat: true, reply: chat, isLLM: true, summary: '' }
   } catch (e) {
     console.error(`[ai] LLM provider "${p.name}" failed:`, e.message)
     noteLlmError(p.name, e)
@@ -784,7 +879,7 @@ async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) 
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
-              systemInstruction: { role: 'user', parts: [{ text: 'You transcribe audio and answer ONLY with the JSON object.' }] },
+              systemInstruction: { parts: [{ text: 'You transcribe audio and answer ONLY with the JSON object.' }] },
               contents: [{
                 role: 'user',
                 parts: [
@@ -792,12 +887,11 @@ async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) 
                   { text: STT_PROMPT },
                 ],
               }],
-              generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
+              generationConfig: { temperature: 0.1, maxOutputTokens: 8192, responseMimeType: 'application/json' },
             }),
           })
           if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
-          const j = await r.json()
-          return j.candidates?.[0]?.content?.parts?.map((x) => x.text || '').join('') || null
+          return geminiText(await r.json(), model)
         })
         if (raw) break
       } catch (e) { lastErr = e }
@@ -860,5 +954,5 @@ function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxCues = 120 } = 
 module.exports = {
   understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
   buildCues, placeCues, transcribeAudio, normalizeTranscriptCues,
-  getLlmHealth, extractJson, safeFilter, normalizeOps,
+  getLlmHealth, getLlmInfo, extractJson, safeFilter, normalizeOps,
 }

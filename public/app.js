@@ -55,7 +55,8 @@ function updateEngineBadge(h) {
       engineBadge.classList.add('warn')
       engineBadge.title = 'The LLM provider is unreachable right now; the built-in rule engine is answering. ' + (h.llm.lastError || '')
     } else {
-      engineBadge.textContent = '🧠 LLM engine'
+      engineBadge.textContent = h.ai ? `🧠 ${h.ai.provider}` : '🧠 LLM engine'
+      if (h.ai) engineBadge.title = `Using ${h.ai.provider} — ${h.ai.model}`
     }
   }
   if (h.renders && h.renders.queued) engineBadge.title = `${h.renders.queued} render(s) queued`

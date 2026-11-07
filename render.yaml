@@ -9,8 +9,9 @@
 #   • A persistent disk keeps uploaded projects (jobs/) across deploys.
 #     Disks require a paid instance — delete the `disk:` block for the free plan
 #     (job history will reset on every deploy/restart).
-#   • Set GEMINI_API_KEY (or OPENAI_API_KEY / ANTHROPIC_API_KEY) in the service's
-#     Environment settings — never commit real keys.
+#   • Set one AI key in the service's Environment settings — never commit real
+#     keys. Supported: GEMINI_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY,
+#     GROQ_API_KEY, OPENCODE_API_KEY, ANTHROPIC_API_KEY.
 #   • Set AUTH_TOKEN there too if you want the app locked behind a password.
 services:
   - type: web
@@ -33,6 +34,12 @@ services:
       - key: GEMINI_API_KEY
         sync: false          # Render will prompt you
       # - key: OPENAI_API_KEY
+      #   sync: false
+      # - key: OPENROUTER_API_KEY
+      #   sync: false
+      # - key: GROQ_API_KEY
+      #   sync: false
+      # - key: OPENCODE_API_KEY
       #   sync: false
       # - key: ANTHROPIC_API_KEY
       #   sync: false
