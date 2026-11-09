@@ -1,0 +1,18 @@
+# AIClipStudio Python processing service — install with:
+#   pip3 install -r requirements.txt
+# Notes:
+#  - opentimelineio is pinned to 0.18.x: 0.18.1 ships no prebuilt wheel for this
+#    platform and would compile from source. 0.18.0 has a wheel.
+#  - opencv uses the headless build (no GUI libs needed in the render server).
+#  - faster-whisper pulls ctranslate2; models download on first transcribe.
+opentimelineio==0.18.0
+opencv-python-headless>=4.8
+Pillow>=10.0
+moviepy>=2.0
+librosa>=0.10
+numpy>=1.24
+#  - lottie: this registry offers 0.7.x (pure-python sdist only; installs
+#    fine). Newer manylinux wheels may exist upstream — relax if available.
+soundfile>=0.12
+lottie>=0.7.2
+faster-whisper>=1.0

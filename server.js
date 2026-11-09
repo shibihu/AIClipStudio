@@ -52,6 +52,8 @@ const {
   understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
   buildCues, placeCues, transcribeAudio, normalizeTranscriptCues, getLlmHealth, getLlmInfo,
 } = require('./ai')
+const timeline = require('./timeline')
+const tools = require('./tools')
 
 const ROOT = __dirname
 const PUBLIC = path.join(ROOT, 'public')
@@ -115,6 +117,59 @@ execFile(FFMPEG, ['-version'], { timeout: 15000 }, (err, stdout) => {
   console.log(err ? `[ai-studio] ffmpeg check FAILED: ${err.message}` : `[ai-studio] ffmpeg OK — ${String(stdout).split('\n')[0]}`)
 })
 console.log(`[ai-studio] ffmpeg: ${FFMPEG}${FONT ? ` | font: ${FONT}` : ' | font: none (text overlays need fontconfig/default font)'}`)
+
+// --- python processing service (moviepy / opencv / pillow / librosa / whisper /
+// opentimelineio / lottie). Spawned once on boot; every capability degrades
+// independently — /api/health reports what the python side actually offers. ---
+const PY_PORT = Number(process.env.PY_SERVICE_PORT) || 8611
+const pyCache = new Map() // module gate — prevents double-spawn on overlapping calls
+let pySpawned = false
+
+function pyCall(ep, payload = {}, timeoutMs = 300000) {
+  return fetch(`http://127.0.0.1:${PY_PORT}/${ep}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+    .then(async (r) => {
+      let j = null
+      try { j = await r.json() } catch { throw new Error(`python service '${ep}' returned http ${r.status}`) }
+      if (!j.ok) throw new Error(j.error || `python service '${ep}' failed`)
+      return j
+    })
+    .catch((e) => {
+      throw new Error(`python service unavailable: ${e.message}`)
+    })
+}
+
+function startPythonService() {
+  if (pySpawned || process.env.PY_SERVICE_DISABLED === '1') return
+  pySpawned = true
+  // prefer the system interpreter: the Termux pip uses android_* platform tags
+  // and rejects manylinux wheels, so manylinux-only builds only install under
+  // /usr/bin/python3 (see docs/INTEGRATION.md → Dependency notes)
+  const bin = process.env.PYTHON || (fs.existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3')
+  const child = spawn(bin, [path.join(ROOT, 'py', 'service.py')], {
+    env: { ...process.env, PY_SERVICE_PORT: String(PY_PORT) },
+    stdio: ['ignore', 'inherit', 'inherit'],
+  })
+  child.on('error', (e) => console.warn(`[ai-studio] python service failed to start (${e.message}) ` +
+    '— moviepy/opencv/librosa/whisper/otio features are degraded this run'))
+  child.on('exit', (code) => {
+    if (code && code !== 0) console.warn(`[ai-studio] python service exited (code ${code})`)
+  })
+}
+
+// quick availability probe used by /api/health and the capability tour
+async function pyHealth() {
+  try {
+    const j = await pyCall('health', {}, 2000)
+    return { up: true, modules: j.modules || {} }
+  } catch (e) {
+    return { up: false, error: e.message }
+  }
+}
 
 // make it obvious at boot whether the AI brain (LLM key) is actually wired up
 const AI_INFO = getLlmInfo()
@@ -298,6 +353,82 @@ async function probe(file) {
   return meta
 }
 
+// --- timeline bootstrap: every job gets a timeline mirroring its base version.
+// runTool() keeps it authoritative; ffmpeg+Remotion renders materialize it. ---
+function buildInitialTimeline(job, jobId) {
+  const v0 = job.versions[0]
+  const dur = Math.max(0.5, v0.meta?.duration || 1)
+  const tl = timeline.newTimeline({
+    id: jobId,
+    fps: v0.meta?.fps || 30,
+    width: v0.meta?.width || null,
+    height: v0.meta?.height || null,
+    name: job.original || v0.name.replace(/^input\./, ''),
+  })
+  const kind = v0.meta?.hasVideo === false ? 'audio' : 'video'
+  const tr = timeline.newTrack(kind, kind === 'video' ? 'V1' : 'A1', 0)
+  tl.tracks = [tr]
+  try {
+    timeline.addClip(tl, {
+      trackId: tr.id,
+      asset: v0.name,
+      kind,
+      name: 'source',
+      duration: dur,
+      sourceDuration: dur,
+      fromVersion: v0.name,
+    }, null)
+  } catch { /* never block an upload on timeline bootstrap */ }
+  return tl
+}
+
+function toTimelineNote(job) {
+  if (!job.timeline) return ''
+  const d = timeline.timelineDuration(job.timeline)
+  const nClips = job.timeline.tracks.reduce((a, t) => a + t.clips.length, 0)
+  return `\n\n🎞 Timeline now: ${nClips} clip${nClips === 1 ? '' : 's'}, ${d}s. Run \`render_timeline\` to materialize it into MP4.`
+}
+
+// --- structured AI tool execution --------------------------------------------
+// POST /api/tool {id, tool, args} runs one tool from tools.js against
+// job.timeline. Non-rendering tools mutate only the timeline (saved
+// immediately); render_timeline registers as a new version on settle.
+async function runTool(jobId, name, args) {
+  const job = getJob(jobId)
+  if (!job) throw Object.assign(new Error('unknown job — upload a clip first'), { status: 404 })
+  const tool = tools.getTool(name)
+  if (!tool) throw Object.assign(
+    new Error(`unknown tool '${name}' — see GET /api/tools`), { status: 400 })
+  if (!job.timeline) job.timeline = buildInitialTimeline(job, jobId)
+  const baseName = job.versions[job.base].name
+  const baseMeta = job.versions[job.base].meta || {}
+  const ctx = {
+    tl: job.timeline,
+    dir: path.join(JOBS, jobId),
+    meta: {
+      versionName: baseName,
+      duration: baseMeta.duration || 0,
+      width: baseMeta.width || 0,
+      height: baseMeta.height || 0,
+      hasAudio: baseMeta.hasAudio !== false,
+      hasVideo: baseMeta.hasVideo !== false,
+    },
+    py: (ep, payload, tmo) => pyCall(ep, payload, tmo || 300000),
+    changed: false,
+  }
+  const result = await tool.fn(ctx, args || {})
+  if (ctx.changed) await saveJob(job, jobId)
+  if (result && result.rendered) {
+    // render_timeline just wrote a new file into the job dir — enroll it as a
+    // version (same reconciliation the ffmpeg external-render path uses)
+    setTimeout(() => {
+      const j2 = getJob(jobId)
+      if (j2) syncExternalRenders(j2, jobId)
+    }, 500)
+  }
+  return { tool: name, result, timeline: timeline.summarize(job.timeline) }
+}
+
 function run(cmd, args, timeoutMs = 300000) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 * 8 }, (err, stdout, stderr) => {
@@ -377,6 +508,69 @@ async function saveJob(job, id) {
   try { await fsp.writeFile(path.join(JOBS, id, 'job.json'), JSON.stringify(job)) } catch { /* transient */ }
 }
 
+// --- external render sync ------------------------------------------------------
+// "External" runs (the same ffmpeg commands shown in chat, executed in a
+// terminal) drop outputs into jobs/<id>/ like every render, but only
+// startRender() ever appended to job.versions — so the website kept showing the
+// old version count. This reconciliation enrolls any new media file as a
+// version: probes it, generates a thumbnail, advances job.next so later in-app
+// renders can't collide with out-N names, and keeps base on the newest video.
+const MEDIA_EXT = /\.(mp4|mov|webm|mkv|m4v|mp3|wav|m4a|aac|ogg|flac|gif)$/i
+const syncing = new Set() // jobId → one reconciliation at a time
+async function syncExternalRenders(job, id) {
+  if (syncing.has(id)) return
+  syncing.add(id)
+  try {
+    const dir = path.join(JOBS, id)
+    let dirMtime
+    try { dirMtime = (await fsp.stat(dir)).mtimeMs } catch { return }
+    if (dirMtime === job.syncedDirMtime) return // folder unchanged since last sync
+    const entries = (await fsp.readdir(dir, { withFileTypes: true })).filter((e) => e.isFile())
+    // outputs owned by renders still queued/running (or waiting rehydrate after
+    // a restart) belong to startRender — enrolling them here would double-register
+    const inFlight = new Set()
+    for (const reg of renders.values()) if (reg.jobId === id && reg.status !== 'done' && reg.status !== 'failed') inFlight.add(reg.outName)
+    try {
+      const pend = JSON.parse(await fsp.readFile(path.join(dir, 'pending.json'), 'utf8'))
+      if (pend && pend.outName) inFlight.add(String(pend.outName))
+    } catch { /* no waiting render */ }
+    const known = new Set(job.versions.map((v) => v.name))
+    let added = 0
+    for (const e of entries) {
+      if (!MEDIA_EXT.test(e.name) || known.has(e.name)) continue
+      if (/^input\./i.test(e.name) || inFlight.has(e.name)) continue // original upload / mid-render output
+      const abs = path.join(dir, e.name)
+      const meta = await probe(abs)
+      const thumbName = `thumb-${e.name}.jpg`
+      const thumbOk = await makeThumb(dir, abs, thumbName)
+      job.versions.push({
+        name: e.name,
+        desc: 'external ffmpeg render',
+        thumb: thumbOk ? `/media/${id}/${encodeURIComponent(thumbName)}` : null,
+        meta: { duration: meta.duration, width: meta.width, height: meta.height, hasVideo: meta.hasVideo, hasAudio: meta.hasAudio, fps: meta.fps },
+      })
+      const n = e.name.match(/^out-(\d+)\./)
+      if (n) job.next = Math.max(job.next || 1, +n[1] + 1)
+      added++
+      console.log(`[ai-studio] synced external render ${id}/${e.name} → v${job.versions.length}`)
+    }
+    if (added) {
+      // mirror startRender: edit base stays on the newest VIDEO version
+      const last = job.versions[job.versions.length - 1]
+      if (last && last.meta?.hasVideo !== false) job.base = job.versions.length - 1
+      sseBroadcast('versions', { jobId: id, added })
+    }
+    // dir mtime moves when thumbnails/job.json get written — re-stat to record
+    // the settled value, then persist so unchanged folders skip this entirely
+    job.syncedDirMtime = (await fsp.stat(dir)).mtimeMs
+    await saveJob(job, id)
+  } catch (e) {
+    console.error(`[ai-studio] external render sync failed for job ${id}: ${e.message}`)
+  } finally {
+    syncing.delete(id)
+  }
+}
+
 // --- async render pipeline ----------------------------------------------------
 // Renders are enqueued with progress; one ffmpeg runs at a time, the rest queue.
 // The chat endpoint answers immediately; the client polls /api/render?id&rid.
@@ -384,6 +578,18 @@ async function saveJob(job, id) {
 const renders = new Map()      // rid → registry entry
 const renderQueue = []         // rids waiting while another render runs
 let activeRuns = 0
+
+// --- live events (SSE) ---------------------------------------------------------
+// Open tabs subscribe to /api/render-events: render status/progress and version
+// list changes push out here, so the UI reacts without any polling.
+const sseClients = new Set()
+function sseBroadcast(evName, data) {
+  if (!sseClients.size) return
+  const chunk = `event: ${evName}\ndata: ${JSON.stringify(data)}\n\n`
+  for (const res of sseClients) {
+    try { res.write(chunk) } catch { sseClients.delete(res) }
+  }
+}
 
 // user message → done/failed replies are appended to the chat history when the
 // render settles, so /api/job stays consistent with what was actually made.
@@ -403,6 +609,9 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
   } else {
     args.push('-i', src)
   }
+  // overlay/b-roll inputs appended after the main input's options; each becomes
+  // input index 1..n referenced by the composed filter graph
+  for (const rel of frag.overlayInputs || []) args.push('-i', path.join(JOBS, jobId, rel))
   if (frag.complex) args.push('-filter_complex', frag.complex)
   else {
     if (frag.vf.length) args.push('-vf', frag.vf.join(','))
@@ -442,6 +651,7 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
   }
   renders.set(rid, reg)
   renderQueue.push(rid)
+  sseBroadcast('render', { jobId, rid, status: 'queued', progress: 0, queuedAhead: Math.max(0, renderQueue.length - 1) })
   try {
     await fsp.writeFile(path.join(JOBS, jobId, 'pending.json'), JSON.stringify({
       rid, srcName, args, cmdDisplay, outPath, outName,
@@ -469,6 +679,7 @@ function pumpRenders() {
 async function startRender(reg) {
   reg.status = 'running'
   reg.startedAt = Date.now()
+  sseBroadcast('render', { jobId: reg.jobId, rid: reg.rid, status: 'running', progress: 0 })
   console.log(`[ai-studio] render ${reg.jobId}/${reg.outName} started (queue ${renderQueue.length})`)
   let errTail = ''
   let code = 1
@@ -490,6 +701,12 @@ async function startRender(reg) {
       for (const m of s.matchAll(/out_time_us=(\d+)/g)) {
         reg.progress = Math.max(reg.progress, Math.min(99, Math.round(((+m[1] / 1e6) / reg.expected) * 100)))
       }
+      // coarsed progress ticks over SSE (10% buckets — avoids event spam)
+      const tier = Math.floor(reg.progress / 10)
+      if (reg.lastPctSent !== tier) {
+        reg.lastPctSent = tier
+        sseBroadcast('render', { jobId: reg.jobId, rid: reg.rid, status: 'running', progress: reg.progress | 0 })
+      }
     })
     proc.stderr.on('data', (d) => {
       for (const line of d.toString().split('\n').filter(Boolean)) {
@@ -503,6 +720,7 @@ async function startRender(reg) {
   const fail = (reg, errTail) => {
     reg.status = 'failed'
     reg.reply = `⚠️ The edit failed while rendering:\n\n${errTail || 'unknown ffmpeg error'}\n\nAsk me differently and I'll retry.`
+    sseBroadcast('render', { jobId: reg.jobId, rid: reg.rid, status: 'failed', progress: reg.progress })
   }
   fsp.rm(path.join(JOBS, reg.jobId, 'pending.json'), { force: true }).catch(() => {})
   if (code === 0) {
@@ -513,6 +731,7 @@ async function startRender(reg) {
     reg.thumb = thumbOk ? `/media/${reg.jobId}/${encodeURIComponent(thumbName)}` : null
     reg.progress = 100
     reg.status = 'done'
+    sseBroadcast('render', { jobId: reg.jobId, rid: reg.rid, status: 'done', progress: 100 })
 
     const job = getJob(reg.jobId)
     if (job) {
@@ -801,6 +1020,7 @@ const server = http.createServer(async (req, res) => {
         llm: getLlmHealth(),
         auth: !!AUTH_TOKEN,
         renders: { active: activeRuns, queued: renderQueue.length, concurrency: RENDER_CONCURRENCY },
+        python: await pyHealth(),
       })
     }
 
@@ -812,7 +1032,9 @@ const server = http.createServer(async (req, res) => {
       for (const name of names) {
         if (/^_/.test(name) || !/^[a-f0-9-]{16,64}$/.test(name)) continue
         const job = loadJob(name)
-        if (!job || !Array.isArray(job.versions) || !job.versions.length) continue
+        if (!job) continue
+        await syncExternalRenders(job, name) // pick up ffmpeg runs done outside the app
+        if (!Array.isArray(job.versions) || !job.versions.length) continue
         let st
         try { st = await fsp.stat(path.join(JOBS, name)) } catch { continue }
         const v0 = job.versions[0]
@@ -883,9 +1105,61 @@ const server = http.createServer(async (req, res) => {
         next: 1,
       }
       history.set(id, job)
+      job.timeline = buildInitialTimeline(job, id)
       await saveJob(job, id)
       console.log(`[ai-studio] upload ${id} ← ${file.filename} (${fmtMB(file.size)})`)
-      return json(res, 200, { id, meta, url: `/media/${id}/${encodeURIComponent(fname)}`, original: file.filename })
+      return json(res, 200, { id, meta, url: `/media/${id}/${encodeURIComponent(fname)}`, original: file.filename, timeline: timeline.summarize(job.timeline) })
+    }
+
+    // ---- overlay: composite an image/clip on top of the current base version ----
+    // multipart (file + from/to/x/y/scale fields); id comes from ?id= because
+    // the multipart parser needs the destination before fields arrive
+    if (p === '/api/overlay' && req.method === 'POST') {
+      const ct = req.headers['content-type'] || ''
+      const bm = ct.match(/boundary=(?:"([^"]+)"|([^;]+))/i)
+      if (!bm) return json(res, 400, { error: 'expected multipart/form-data' })
+      const id = url.searchParams.get('id') || ''
+      if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)) return json(res, 400, { error: 'bad job id' })
+      const dir = path.join(JOBS, id)
+      const job = getJob(id)
+      if (!job) return json(res, 404, { error: 'unknown job — upload a clip first' })
+      const tmp = path.join(dir, 'overlay.part')
+      let parsed
+      try {
+        parsed = await parseMultipart(req, (bm[1] || bm[2]).trim(), tmp)
+      } catch (e) {
+        return json(res, /too large/i.test(e.message) ? 413 : 400, { error: e.message })
+      }
+      const { file, fields } = parsed
+      if (!file || !file.size) return json(res, 400, { error: 'no file received' })
+      const srcName = job.versions[job.base].name
+      const src = path.join(dir, srcName)
+      const meta = await probe(src)
+      if (meta.hasVideo === false) {
+        return json(res, 400, { error: 'This version is audio-only, so there is nothing to overlay visually. Pin a video version (★) first.' })
+      }
+      const ext = extOf(file.filename, file.mime)
+      const fname = `overlay-${Date.now().toString(36)}.${ext}`
+      await fsp.rename(tmp, path.join(dir, fname))
+      const from = parseFloat(fields.from)
+      const to = parseFloat(fields.to)
+      const overlay = {
+        file: fname,
+        x: fields.x || '(W-w)/2',
+        y: fields.y || '(H-h)/2',
+        scale: parseInt(fields.scale, 10) || null,
+        from: Number.isFinite(from) && from > 0 ? from : null,
+        to: Number.isFinite(to) && to > 0 ? to : null,
+      }
+      const ops = [{ kind: 'overlay', file: fname, label: `overlay ${file.filename}` }]
+      const frag = build(ops, meta, FONT, [overlay])
+      const summary = `Overlay ${file.filename}${overlay.from != null ? ` starting at ${Math.round(overlay.from * 100) / 100}s` : ''}`
+      const userMsg = `🖼 Add overlay ${file.filename}`
+      const { rid } = await enqueueRender(job, id, srcName, frag, { ops, summary }, meta, userMsg)
+      const reply = `🖼 Overlaid <b>${file.filename}</b> on the base clip${overlay.from != null ? ' (timed start)' : ''} — rendering ⏳`
+      job.msgs.push({ role: 'user', content: userMsg }, { role: 'assistant', content: reply + ' (started)' })
+      await saveJob(job, id)
+      return json(res, 200, { reply, renderId: rid, summary, ops: frag.desc, commands: [] })
     }
 
     // ---- chat / edit ----
@@ -908,6 +1182,7 @@ const server = http.createServer(async (req, res) => {
           '🔄 Frame — “mirror”, “rotate 90”, “upside down”',
           '📐 Aspect — “make it square”, “9:16 for tiktok”, “720p”',
           '💬 Text — “add text \'Good Vibes\' at the top”',
+          '🖼 Overlays — the 🖼 Add overlay button puts an image or clip on top (timed = whole length or a range)',
           ' 🗣 Captions — paste your script via the ✨ captions chip and I’ll time it to your speech',
           '🎞 GIF — “make a gif at 15 fps”',
           '⏪ FX — “reverse”, “boomerang”, “blur”, “black and white”, “vintage”',
@@ -953,8 +1228,41 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { reply, commands: [], media: null })
       }
 
+      // ---- structured tool calls (timeline + python engine) -----------------
+      // The LLM (or API client) may answer with {"kind":"tool","name",...}
+      // ops alongside the classic ffmpeg ops; tools mutate job.timeline or run
+      // python analysis. Serial execution keeps ordering deterministic.
+      const toolOps = result.ops.filter((o) => o.kind === 'tool')
+      const mediaOps = result.ops.filter((o) => o.kind !== 'tool')
+      const toolOutcomes = []
+      const toolFails = []
+      for (const op of toolOps.slice(0, 8)) {
+        try {
+          const r = await runTool(id, op.name || op.tool, op.args || {})
+          toolOutcomes.push({ tool: op.name || op.tool, result: r.result })
+        } catch (e) {
+          toolFails.push(`${op.name || op.tool}: ${e.message}`.slice(0, 300))
+        }
+      }
+      if (!mediaOps.length) {
+        if (!toolOutcomes.length && toolFails.length) {
+          const reply = '⚠️ The tool call failed: ' + toolFails.join('; ')
+          job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+          return json(res, 200, { reply, commands: [], media: null })
+        }
+        let reply = toolOutcomes.map((o) => `🧰 ${o.tool} — ok`).join('\n')
+        if (toolFails.length) reply += `\n⚠️ Some calls failed: ${toolFails.join('; ')}`
+        reply += toTimelineNote(job)
+        job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+        return json(res, 200, { reply, commands: [], media: null, timeline: timeline.summarize(job.timeline) })
+      }
+      if (toolFails.length) {
+        console.warn(`[ai-studio] chat tool failures (continuing with media ops): ${toolFails.join('; ')}`)
+      }
+      result.ops = mediaOps
+
       // 2) build the ffmpeg pipeline
-      if (!meta.hasAudio && result.ops.some((o) => ['audioOut', 'volume'].includes(o.kind))) {
+      if (!meta.hasAudio && mediaOps.some((o) => ['audioOut', 'volume'].includes(o.kind))) {
         const reply = "This version has no audio track (it's a GIF or was muted), so there's nothing to extract or adjust there. Try a visual edit instead — or pin another version with ★."
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
@@ -986,6 +1294,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- render polling ----
+    // live push channel: render progress + external-render syncs (SSE)
+    if (p === '/api/render-events' && req.method === 'GET') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      })
+      res.write('retry: 3000\n\n')
+      sseClients.add(res)
+      res.on('close', () => sseClients.delete(res))
+      return
+    }
+
     if (p === '/api/render' && req.method === 'GET') {
       const id = url.searchParams.get('id') || ''
       const rid = url.searchParams.get('rid') || ''
@@ -1003,6 +1324,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.searchParams.get('id') || ''
       const job = getJob(id)
       if (!job) return json(res, 404, { error: 'unknown job' })
+      await syncExternalRenders(job, id) // pick up ffmpeg runs done outside the app
       return json(res, 200, { versions: job.versions, base: job.base, msgs: job.msgs })
     }
 
@@ -1017,6 +1339,40 @@ const server = http.createServer(async (req, res) => {
       await saveJob(job, id)
       console.log(`[ai-studio] job ${id} base → v${i + 1} (${job.versions[i].name})`)
       return json(res, 200, { ok: true, base: i })
+    }
+
+    // delete a version and its media (v0, the original upload, can never go)
+    if (p === '/api/version' && req.method === 'DELETE') {
+      const { id, index } = await readJson(req)
+      const job = getJob(id)
+      if (!job) return json(res, 404, { error: 'unknown job' })
+      const i = parseInt(index, 10)
+      if (!Number.isInteger(i) || i <= 0 || i >= job.versions.length) return json(res, 400, { error: 'bad version index' })
+      const v = job.versions[i]
+      const dir = path.join(JOBS, id)
+      // any render still queued/running from this version failed the moment
+      // the file is removed — fail it now so the chat shows why
+      for (const reg of renders.values()) {
+        if (reg.jobId !== id || reg.status === 'done' || reg.status === 'failed') continue
+        if (reg.srcName === v.name) {
+          reg.status = 'failed'
+          reg.reply = '⚠️ The render was cancelled: the version it was editing from got deleted.'
+          try { reg.proc?.kill('SIGKILL') } catch { /* already gone */ }
+        }
+      }
+      job.versions.splice(i, 1)
+      // base moves down if it came after the deleted slot, and re-pins to the
+      // last version in any edge case where it would point past the end
+      if (job.base >= i) job.base = Math.max(0, job.base - 1)
+      if (job.base > job.versions.length - 1) job.base = job.versions.length - 1
+      await saveJob(job, id)
+      // media cleanup: output file, its thumbnail, per-version frame cache
+      const frames = path.join(dir, `frames-${v.name.replace(/\W+/g, '_').replace(/_+$/, '')}`)
+      await fsp.rm(path.join(dir, v.name), { force: true }).catch(() => {})
+      await fsp.rm(path.join(dir, `thumb-${v.name}.jpg`), { force: true }).catch(() => {})
+      await fsp.rm(frames, { recursive: true, force: true }).catch(() => {})
+      console.log(`[ai-studio] job ${id} deleted v${i + 1} (${v.name})`)
+      return json(res, 200, { ok: true })
     }
 
     // delete a job and all its media
@@ -1128,6 +1484,65 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { reply, renderId: rid, summary, ops: frag.desc, commands: [] })
     }
 
+    // ---- structured AI tools ---------------------------------------------
+    if (p === '/api/tools' && req.method === 'GET') {
+      return json(res, 200, { tools: tools.CATALOG.map((t) => ({ name: t.name, group: t.group, summary: t.summary, args: t.args })) })
+    }
+    if (p === '/api/tool' && req.method === 'POST') {
+      const { id, tool, args = {} } = await readJson(req)
+      try {
+        const r = await runTool(id, tool, args)
+        return json(res, 200, r)
+      } catch (e) {
+        return json(res, e.status || 500, { error: e.message })
+      }
+    }
+
+    // ---- timeline: read, replace, OTIO export -----------------------------
+    if (p === '/api/timeline' && req.method === 'GET') {
+      const id = url.searchParams.get('id') || ''
+      const job = getJob(id)
+      if (!job) return json(res, 404, { error: 'unknown job' })
+      if (!job.timeline) job.timeline = buildInitialTimeline(job, id)
+      if (url.searchParams.get('format') === 'otio') {
+        try {
+          const r = await pyCall('timeline/to_otio', { timeline: timeline.sanitize(job.timeline) }, 30000)
+          return json(res, 200, { ok: true, otio: JSON.parse(r.otio) })
+        } catch (e) {
+          return json(res, 503, { error: e.message })
+        }
+      }
+      return json(res, 200, { timeline: timeline.summarize(job.timeline) })
+    }
+    if (p === '/api/timeline' && req.method === 'POST') {
+      const { id, timeline: tlIn, otio } = await readJson(req)
+      const job = getJob(id)
+      if (!job) return json(res, 404, { error: 'unknown job' })
+      if (otio) {
+        if (typeof otio !== 'string' || !(otio.trim().startsWith('{') || otio.trim().startsWith('['))) {
+          return json(res, 400, { error: 'otio must be inline .otio JSON (files are not accepted via HTTP for safety)' })
+        }
+        const r = await pyCall('timeline/from_otio', { otio }, 30000).catch((e) => ({ error: e.message, ok: false }))
+        if (!r.ok) return json(res, 503, { error: r.error })
+        job.timeline = timeline.sanitize(r.timeline)
+      } else {
+        try { job.timeline = timeline.sanitize(tlIn) } catch (e) { return json(res, 400, { error: e.message }) }
+      }
+      await saveJob(job, id)
+      return json(res, 200, { ok: true, timeline: timeline.summarize(job.timeline) })
+    }
+
+    // ---- python STT status proxy (job lives inside the python service) ----
+    if (p === '/api/py/stt/status' && req.method === 'GET') {
+      const jid = url.searchParams.get('job') || ''
+      try {
+        const r = await pyCall('stt/status', { job: jid }, 30000)
+        return json(res, 200, r)
+      } catch (e) {
+        return json(res, 503, { error: e.message })
+      }
+    }
+
     return send(res, 404, 'not found')
   } catch (e) {
     console.error(e)
@@ -1142,7 +1557,22 @@ server.listen(PORT, () => {
     ? '[ai-studio] 🔒 access locked by AUTH_TOKEN — enter it in the browser to start'
     : '[ai-studio] 🔓 no AUTH_TOKEN set — open access (set AUTH_TOKEN in .env to lock)')
   console.log(`[ai-studio] job cleanup every 30 min, TTL ${Math.round(JOBS_TTL_MS / 3600000)}h | render concurrency: ${RENDER_CONCURRENCY}\n`)
+  startPythonService()
 })
 setInterval(cleanupJobs, 30 * 60 * 1000).unref()
 cleanupJobs()
 rehydrateRenders()
+
+// periodic sweep: ffmpeg runs made outside the app (e.g. pasted into a terminal)
+// register as versions without waiting for the next /api read
+async function sweepExternalRenders() {
+  let names
+  try { names = await fsp.readdir(JOBS) } catch { return }
+  for (const id of names) {
+    if (/^_/.test(id) || !/^[a-f0-9-]{16,64}$/.test(id)) continue
+    const job = getJob(id)
+    if (job) await syncExternalRenders(job, id)
+  }
+}
+setInterval(sweepExternalRenders, 15 * 1000).unref()
+sweepExternalRenders() // also enrolls outputs already orphaned in the jobs folder

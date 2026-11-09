@@ -13,7 +13,11 @@ const drop = $('drop'), video = $('video'), chat = $('chat'), form = $('chatForm
   trimRange = $('trimRange'), trimIn = $('trimIn'), trimOut = $('trimOut'),
   tLabelA = $('tLabelA'), tLabelB = $('tLabelB'),
   trimApply = $('trimApply'), trimClear = $('trimClear'),
-  capChip = $('capChip'), capWrap = $('capWrap'), capText = $('capText'), capSend = $('capSend'), capAuto = $('capAuto')
+  capChip = $('capChip'), capWrap = $('capWrap'), capText = $('capText'), capSend = $('capSend'), capAuto = $('capAuto'),
+  abModal = $('abModal'), abTitle = $('abTitle'), abClose = $('abClose'),
+  abVideoA = $('abVideoA'), abVideoB = $('abVideoB'), abSeek = $('abSeek'),
+  abPlay = $('abPlay'), abSwap = $('abSwap'), abPinB = $('abPinB'), abDelA = $('abDelA'),
+  overlayBtn = $('overlayBtn')
 
 let jobId = null
 let busy = false
@@ -23,6 +27,8 @@ let previewIdx = null  // version shown in the player
 let stripDur = null    // filmstrip duration
 let tA = 0, tB = 1     // trim handles, fractions of the strip
 let dragHandle = null
+let abA = null        // version picked as side A of an A/B compare (null = none)
+let abIdx = { a: 0, b: 0 } // versions currently open in the compare modal
 
 /* ---------- auth (only active when the server sets AUTH_TOKEN) ---------- */
 
@@ -134,6 +140,7 @@ function showMedia(url, meta, label) {
   playerWrap.classList.remove('hidden')
   drop.classList.add('hidden')
   deleteBtn.hidden = false
+  overlayBtn.hidden = false
   video.src = url
   if (meta) {
     metaRow.innerHTML = [
@@ -148,6 +155,50 @@ function showMedia(url, meta, label) {
 }
 
 newBtn.addEventListener('click', () => location.reload())
+
+// overlay: pick an image or video, optional timing, render immediately on the base
+overlayBtn.addEventListener('click', () => overlayInput().click())
+let overlayFileInput = null
+function overlayInput() {
+  if (overlayFileInput) return overlayFileInput
+  overlayFileInput = document.createElement('input')
+  overlayFileInput.type = 'file'
+  overlayFileInput.accept = 'image/*,video/*'
+  overlayFileInput.addEventListener('change', () => overlayFileInput.files[0] && sendOverlay(overlayFileInput.files[0]))
+  document.body.appendChild(overlayFileInput)
+  return overlayFileInput
+}
+
+async function sendOverlay(file) {
+  if (!jobId || busy) { if (!busy) addMsg('ai', '⬆️ Upload a clip first — overlays stack on an existing version.'); return }
+  const meta = versions[previewIdx]?.meta || versions[base]?.meta
+  const scale = meta?.width ? Math.max(2, Math.round(meta.width * 0.25 / 2) * 2) : 320
+  const fromStr = prompt('From how many seconds of the clip should the overlay show? Leave empty to keep it for the whole clip.')
+  const from = fromStr && fromStr.trim() && Number.isFinite(parseFloat(fromStr)) ? parseFloat(fromStr) : ''
+  const toStr = prompt('Until how many seconds should the overlay show? Leave empty to keep it until the end.')
+  const to = toStr && toStr.trim() && Number.isFinite(parseFloat(toStr)) ? parseFloat(toStr) : ''
+  busy = true; sendBtn.disabled = true
+  addMsg('user', `🖼 Add overlay ${esc(file.name)}`)
+  const holder = addMsg('ai', busyHTML('building the overlay render…'))
+  try {
+    const fd = new FormData()
+    fd.append('file', file)
+    if (from !== '') fd.append('from', String(from))
+    if (to !== '') fd.append('to', String(to))
+    fd.append('scale', String(scale))
+    const r = await fetchA(`/api/overlay?id=${encodeURIComponent(jobId)}`, { method: 'POST', body: fd })
+    const j = await r.json()
+    if (j.error) throw new Error(j.error)
+    if (j.renderId) await pollRender(j, holder)
+    else { holder.remove(); finishReply(j) }
+  } catch (e) {
+    holder.remove()
+    addMsg('ai', '⚠️ ' + e.message, true)
+  } finally {
+    busy = false; sendBtn.disabled = false
+    chat.scrollTop = chat.scrollHeight
+  }
+}
 
 deleteBtn.addEventListener('click', async () => {
   if (!jobId) return
@@ -210,6 +261,41 @@ async function loadVersions() {
       })
       foot.appendChild(pin)
     }
+    if (i > 0) {
+      const del = document.createElement('span')
+      del.className = 'vdel'
+      del.title = 'delete this version (removes its file too)'
+      del.textContent = '🗑'
+      del.addEventListener('click', async (e) => {
+        e.stopPropagation()
+        const sure = confirm(`Delete version v${i + 1} (${v.name})? Its media file is removed from disk too. This cannot be undone.`)
+        if (!sure) return
+        try { await fetchA('/api/version', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: jobId, index: i }) }) } catch { return }
+        if (previewIdx >= i) previewIdx = Math.max(0, previewIdx - 1)
+        if (abA !== null) { if (abA === i) abA = null; else if (abA > i) abA-- }
+        addMsg('ai', `🗑 Deleted <b>v${i + 1}</b> — its file and thumbnail are gone.`)
+        previewVersion(previewIdx)
+      })
+      foot.appendChild(del)
+    }
+    const ab = document.createElement('span')
+    ab.className = 'vab' + (abA === i ? ' armed' : '')
+    ab.title = abA === null
+      ? 'A/B compare — pick this version as one side'
+      : abA === i
+        ? 'A/B compare — cancel this pick'
+        : `compare against v${abA + 1}`
+    ab.textContent = '⇄'
+    ab.addEventListener('click', (e) => {
+      e.stopPropagation()
+      if (abA === null) { abA = i; loadVersions(); return }
+      if (abA === i) { abA = null; loadVersions(); return }
+      const a = Math.min(abA, i), b = Math.max(abA, i)
+      abA = null
+      openAb(a, b)
+      loadVersions()
+    })
+    foot.appendChild(ab)
     el.appendChild(foot)
     el.addEventListener('click', () => previewVersion(i))
     versionStrip.appendChild(el)
@@ -224,6 +310,84 @@ function previewVersion(i) {
   loadVersions()
   loadStrip(v.name, v.meta)
 }
+
+/* ---------- A/B compare modal ---------- */
+
+function openAb(ai, bi) {
+  const A = versions[ai], B = versions[bi]
+  if (!A || !B) return
+  abIdx = { a: ai, b: bi }
+  abTitle.textContent = `⇄ v${ai + 1} vs v${bi + 1}`
+  abVideoA.src = `/media/${jobId}/${encodeURIComponent(A.name)}`
+  abVideoB.src = `/media/${jobId}/${encodeURIComponent(B.name)}`
+  abVideoA.load(); abVideoB.load()
+  abSeek.value = 0
+  abPlay.textContent = '▶▶ Play both'
+  abModal.classList.remove('hidden')
+}
+
+function closeAb() {
+  abModal.classList.add('hidden')
+  abVideoA.pause(); abVideoB.pause()
+  abVideoA.removeAttribute('src'); abVideoB.removeAttribute('src')
+  abVideoA.load(); abVideoB.load()
+}
+
+abClose.addEventListener('click', closeAb)
+abModal.addEventListener('click', (e) => { if (e.target === abModal) closeAb() })
+
+abPlay.addEventListener('click', () => {
+  if (abVideoA.paused) { abVideoA.play().catch(() => {}); abVideoB.play().catch(() => {}); abPlay.textContent = '⏸ Pause both' }
+  else { abVideoA.pause(); abVideoB.pause(); abPlay.textContent = '▶▶ Play both' }
+})
+
+abSeek.addEventListener('input', () => {
+  const dur = Math.max(abVideoA.duration || 0, abVideoB.duration || 0)
+  if (!dur || !isFinite(dur)) return
+  const t = (abSeek.value / 1000) * dur
+  for (const v of [abVideoA, abVideoB]) {
+    v.pause()
+    const d = v.duration
+    if (d && isFinite(d)) v.currentTime = Math.min(t, Math.max(0, d - 0.05))
+  }
+})
+
+// the slider advances with side A; durations may differ (different trims)
+abVideoA.addEventListener('timeupdate', () => {
+  const dur = Math.max(abVideoA.duration || 0, abVideoB.duration || 0)
+  if (!dur || !isFinite(dur)) return
+  abSeek.value = Math.round((abVideoA.currentTime / dur) * 1000)
+})
+
+abSwap.addEventListener('click', () => {
+  abIdx = { a: abIdx.b, b: abIdx.a }
+  const tmp = abVideoA.src
+  abVideoA.src = abVideoB.src
+  abVideoB.src = tmp
+  abVideoA.load(); abVideoB.load()
+  abTitle.textContent = `⇄ v${abIdx.a + 1} vs v${abIdx.b + 1}`
+  abSeek.value = 0
+})
+
+abPinB.addEventListener('click', async () => {
+  try { await fetchA('/api/version', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: jobId, index: abIdx.b }) }) } catch { return }
+  base = abIdx.b
+  closeAb()
+  addMsg('ai', `📌 Base version set to <b>v${abIdx.b + 1}</b> — the compare winner is now where new edits start.`)
+  previewVersion(abIdx.b)
+})
+
+abDelA.addEventListener('click', async () => {
+  const v = versions[abIdx.a]
+  if (!v) return
+  const sure = confirm(`Delete version v${abIdx.a + 1} (${v.name})? Its media file is removed from disk too. This cannot be undone.`)
+  if (!sure) return
+  try { await fetchA('/api/version', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: jobId, index: abIdx.a }) }) } catch { return }
+  closeAb()
+  if (previewIdx >= abIdx.a) previewIdx = Math.max(0, previewIdx - 1)
+  addMsg('ai', `🗑 Deleted <b>v${abIdx.a + 1}</b> — the compare loser is gone.`)
+  previewVersion(previewIdx)
+})
 
 /* ---------- filmstrip / visual trim picker ---------- */
 
@@ -354,10 +518,44 @@ function busyHTML(label) {
 
 const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms))
 
+/* ---------- live events (SSE) ---------- */
+
+// render progress + version syncs arrive pushed instead of polled; polling in
+// pollRender stays as the fallback and still owns the done/failed handling
+let liveRender = null // { rid, lab, fill } — set by pollRender
+let es = null
+
+function connectEvents() {
+  if (es) return
+  try {
+    const tok = localStorage.getItem('auth') || ''
+    es = new EventSource('/api/render-events' + (tok ? '?auth=' + encodeURIComponent(tok) : ''))
+  } catch { /* EventSource unavailable — polling covers it */ return }
+  es.addEventListener('render', (e) => {
+    let d
+    try { d = JSON.parse(e.data) } catch { return }
+    if (!liveRender || liveRender.rid !== d.rid) return
+    if (d.status === 'queued') {
+      if (liveRender.lab) liveRender.lab.textContent = '⏳ queued'
+    } else if (d.status === 'running') {
+      if (liveRender.fill) liveRender.fill.style.width = (d.progress || 0) + '%'
+      if (liveRender.lab) liveRender.lab.textContent = `ffmpeg running — ${d.progress || 0}%`
+    }
+  })
+  es.addEventListener('versions', (e) => {
+    let d
+    try { d = JSON.parse(e.data) } catch { return }
+    if (d.jobId === jobId) loadVersions()
+  })
+}
+connectEvents() // auth success does a full reload, so the eventsource always comes up with its token in place
+
 async function pollRender(j, holder) {
+  liveRender = { rid: j.renderId }
   holder.innerHTML = `<div>${md(j.reply || '🛠 rendering…')}</div>\n` + busyHTML('ffmpeg is running')
   const lab = holder.querySelector('.plab')
   const fill = holder.querySelector('.pfill')
+  liveRender.lab = lab; liveRender.fill = fill
   chat.scrollTop = chat.scrollHeight
   let misses = 0
   for (;;) {

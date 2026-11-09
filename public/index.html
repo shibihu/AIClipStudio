@@ -40,6 +40,27 @@
     </div>
   </div>
 
+  <!-- A/B compare modal -->
+  <div id="abModal" class="modal hidden">
+    <div class="modalcard abcard">
+      <div class="modalhead">
+        <strong id="abTitle">⇄ compare</strong>
+        <button id="abClose" class="btn ghost">✕</button>
+      </div>
+      <div class="abstage">
+        <div class="abhalf"><video id="abVideoA" playsinline></video></div>
+        <div class="abhalf"><video id="abVideoB" playsinline></video></div>
+      </div>
+      <input id="abSeek" type="range" min="0" max="1000" value="0" />
+      <div class="abcontrols">
+        <button id="abPlay" class="btn solid">▶▶ Play both</button>
+        <button id="abSwap" class="btn ghost">⇄ swap sides</button>
+        <button id="abPinB" class="btn ghost">★ pin B as base</button>
+        <button id="abDelA" class="btn ghost danger">🗑 delete A</button>
+      </div>
+    </div>
+  </div>
+
   <main>
     <!-- LEFT: the video stage -->
     <section id="stage">
@@ -67,6 +88,7 @@
         <div class="stage-actions">
           <a id="downloadBtn" class="btn solid" download hidden>⬇ Download result</a>
           <a id="dlOriginal" class="btn ghost" download hidden>⬇ original</a>
+          <button id="overlayBtn" class="btn ghost" hidden>🖼 Add overlay</button>
           <button id="newBtn" class="btn ghost">＋ New clip</button>
           <button id="deleteBtn" class="btn ghost danger" hidden>🗑 Delete</button>
         </div>
@@ -93,7 +115,7 @@
 
       <div id="chips" class="chips">
         <button data-q="remove the first 2 seconds">✂️ cut first 2s</button>
-        <button data-q="crop to 9:16 for tiktok, scale to 1080p">📱 TikTok ready</button>
+        <button data-q="make it a 9:16 vertical canvas for tiktok with a blurred background">📱 TikTok ready</button>
         <button data-q="2x speed">⏩ 2× speed</button>
         <button data-q="mute the audio">🔇 mute</button>
         <button id="capChip">🗣 captions from script</button>

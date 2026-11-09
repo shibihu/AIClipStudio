@@ -264,6 +264,21 @@ main {
 .vstar { color: #ffd66b; }
 .vbase { color: var(--muted); cursor: pointer; padding: 0 2px; }
 .vbase:hover { color: #ffd66b; }
+.vdel { color: var(--muted); cursor: pointer; padding: 0 2px; }
+.vdel:hover { color: #ff6b6b; }
+.vab { color: var(--muted); cursor: pointer; padding: 0 2px; }
+.vab:hover { color: #9ad1ff; }
+.vab.armed { color: var(--accent); }
+
+/* ---------- A/B compare modal ---------- */
+.abcard { width: min(880px, 94vw); }
+.abstage { display: flex; gap: 10px; }
+.abhalf { flex: 1; min-width: 0; }
+.abhalf video {
+  width: 100%; min-height: 220px; border-radius: 10px;
+  background: #0a0d14; border: 1px solid var(--line);
+}
+.abcontrols { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ---------- trim picker ---------- */
 .trimwrap { display: flex; flex-direction: column; gap: 8px; }

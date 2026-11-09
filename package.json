@@ -1,14 +1,26 @@
 {
   "name": "ai-clip-studio",
-  "version": "1.0.0",
-  "description": "Upload a clip, talk to the AI, it edits with ffmpeg. Zero-dependency Node.js app.",
+  "version": "1.1.0",
+  "description": "Upload a clip, talk to the AI, it edits with ffmpeg + a full timeline engine (Remotion render, OTIO timeline, python analysis engine).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/engine.test.js"
+    "test": "node --test test/engine.test.js",
+    "py:test": "PY_SERVICE_PORT=8621 ./.venv/bin/python py/test_service.py",
+    "remotion:render": "node scripts/remotion-render.js",
+    "remotion:studio": "node scripts/remotion-render.js remotion/sample-props.json --studio"
   },
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@remotion/cli": "*",
+    "@remotion/lottie": "*",
+    "@remotion/transitions": "*",
+    "lottie-web": "*",
+    "react": "~19",
+    "react-dom": "~19",
+    "remotion": "*"
+  }
 }

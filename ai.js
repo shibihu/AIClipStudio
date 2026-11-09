@@ -14,6 +14,8 @@ function num(str) {
 
 const path = require('path')
 const fs = require('fs')
+// tool catalog (timeline.js-based editing tools the LLM can emit as ops)
+const { getTool, catalogHint } = require('./tools')
 
 function even(n) {
   n = Math.round(n)
@@ -180,7 +182,9 @@ function understand(message, meta) {
 
   // ---- blur ----
   const blurM = s.match(/blur(?:\s*(?:it|everything|the (?:whole )?video))?(?:\s*(?:by|of|radius)\s*(\d+))?/)
-  if (blurM) ops.push({ kind: 'blur', label: `blur (radius ${blurM[1] || 4})`, vf: `boxblur=${Math.min(20, parseInt(blurM[1] || '4', 10))}` })
+  // a "blur the background" canvas request adds its own blurred-background
+  // operator — full-frame boxblur here would fight it
+  if (blurM && !/background|behind/.test(s)) ops.push({ kind: 'blur', label: `blur (radius ${blurM[1] || 4})`, vf: `boxblur=${Math.min(20, parseInt(blurM[1] || '4', 10))}` })
 
   // ---- text overlay ----
   if (/(text|title|caption|watermark|subtitle|write|overlay)/.test(s)) {
@@ -206,6 +210,24 @@ function understand(message, meta) {
     }
   }
 
+  // ---- platform presets (9:16 vertical canvas for TikTok / Shorts / Reels) ----
+  // "square" wins first — aspect op and canvas op must not fight each other
+  // ---- platform presets (9:16 vertical canvas for TikTok / Shorts / Reels) ----
+  // only on explicit *canvas* wording: plain "9:16 for tiktok" keeps the older
+  // center-crop behavior, and "square" always wins as a 1:1 aspect crop
+  if (/\b(tiktok|tik ?tok|shorts?|reels?|instagram|9:16|full.?screen)\b/.test(s)
+    && /\b(canvas|letterbox|blurred? background|fit|no crop|crop out|without cropping)\b/.test(s)
+    && !/square|\b1:1\b/.test(s)) {
+    const blur = /blur([^a-z]*the )?[^.,;]*(background|behind|sides)/.test(s)
+    ops.push({ kind: 'preset', label: blur ? '9:16 canvas 1080×1920 (blurred background)' : '9:16 canvas 1080×1920 (letterboxed)', w: 1080, h: 1920, blur })
+    // an aspect crop to the same ratio would defeat the canvas — cropping to
+    // 9:16 BEFORE letterboxing turns the fit into a lossy center-crop
+    const ratio = 1080 / 1920
+    for (let k = ops.length - 2; k >= 0; k--) {
+      if (ops[k].kind === 'aspect' && Math.abs(ops[k].rx / ops[k].ry - ratio) < 0.02) ops.splice(k, 1)
+    }
+  }
+
   const knownOp = ops.length > 0
   return { ops, unknown: !knownOp, summary: ops.map((o) => o.label).join(' + ') }
 }
@@ -215,7 +237,7 @@ function understand(message, meta) {
 // Returns { vf:[], af:[], extraArgs:[], complex:string|null, output:'mp4'|'gif'|'mp3', desc:[] }
 // ---------------------------------------------------------------------------
 
-function build(ops, meta, fontFile) {
+function build(ops, meta, fontFile, overlays = []) {
   const w = meta.width || 1280
   const h = meta.height || 720
   const out = { vf: [], af: [], extraArgs: [], complex: null, output: 'mp4', desc: [] }
@@ -267,6 +289,20 @@ function build(ops, meta, fontFile) {
         out.output = 'gif'
         out.complex = `[0:v]fps=${op.fps},scale=${op.width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`
         break
+      case 'preset': {
+        // platform canvas (TikTok/Shorts/Reels): fit inside WxH. blur:true
+        // fills the bars with a blurred copy via split; gif/boomerang own the
+        // complex graph, so the canvas loses priority there
+        if (out.output !== 'mp4' || out.complex) break
+        const W = op.w || 1080, H = op.h || 1920
+        if (op.blur) {
+          out.complex = `[0:v]split=2[bg][fg];[bg]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=20:2[bgf];[fg]scale=${W}:${H}:force_original_aspect_ratio=decrease[fgf];[bgf][fgf]overlay=(W-w)/2:(H-h)/2,setsar=1`
+        } else {
+          out.vf.push(`scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2`)
+          out.vf.push('setsar=1')
+        }
+        break
+      }
       case 'boomerang':
         out.complex = '[0:v]split[r][r2];[r]setsar=1[f];[r2]reverse,setsar=1[rv];[f][rv]concat=n=2:v=1:a=0'
         out.af = []
@@ -286,6 +322,34 @@ function build(ops, meta, fontFile) {
   if (out._filterTrim) {
     out.vf.unshift(out._trimFilters.v)
     if (out.output === 'mp4') out.af.unshift(out._trimFilters.a)
+  }
+
+  // --- overlay track (b-roll / stickers / logo) --------------------------------
+  // overlays: [{ file (relative to the job dir), x, y, scale, from, to }]
+  // x/y accept full overlay-filter expressions like "(W-w)/2". Each overlay
+  // becomes one extra ffmpeg input, composited in list order on top of the
+  // (otherwise filtered) base. Keeps out of gif/boomerang graphs.
+  out.overlayInputs = []
+  if (overlays.length && out.output === 'mp4' && !out.complex) {
+    out.vf = out.vf.filter((f) => f !== 'setsar=1') // setsar runs at the end of the graph
+    let chunks = [`[0:v]${out.vf.join(',') || 'null'}[base]`]
+    let label = 'base'
+    overlays.forEach((o, i) => {
+      const sc = o.scale ? `,scale=${o.scale}:-1` : ''
+      chunks.push(`[${i + 1}:v]setsar=1${sc}[ov${i}]`)
+      const x = o.x ?? '(W-w)/2'
+      const y = o.y ?? '(H-h)/2'
+      const en = o.from != null || o.to != null
+        ? `:enable='between(t,${o.from ?? 0},${o.to ?? 1e5})'`
+        : ''
+      // the LAST chain ends unlabeled — a labeled graph output is unconnected
+      // and ffmpeg refuses to bind it (same trap as gif/boomerang graphs)
+      chunks.push(`[${label}][ov${i}]overlay=x=${x}:y=${y}${en}` + (i === overlays.length - 1 ? '' : `[ovl${i}]`))
+      if (i < overlays.length - 1) label = `ovl${i}`
+    })
+    out.complex = chunks.join(';')
+    out.vf = []
+    out.overlayInputs = overlays.map((o) => o.file)
   }
 
   if (out.output === 'mp3') {
@@ -404,13 +468,30 @@ Allowed edit operation kinds and their fields:
 {"kind":"text","text":"...","pos":"top|center|bottom","size":int,"color":"white"}
 {"kind":"gif","fps":int,"width":int} {"kind":"reverse"} {"kind":"boomerang"}
 {"kind":"fps","value":int} {"kind":"gray"} {"kind":"sepia"}
+{"kind":"preset","w":int,"h":int,"blur":true|false} — format to a fixed canvas like the vertical 9:16 1080×1920 (TikTok/Shorts/Reels); blur:true fills the leftover bars with a blurred copy instead of black. Use w=1080,h=1920 for vertical platforms.
 {"kind":"eq","brightness":-0.1..0.1|null,"saturation":0..2|null,"contrast":0.5..2|null}
 {"kind":"blur","radius":int}
 For ANY other visual or audio effect express it with a generic filter op so arbitrary user requests still work:
 {"kind":"filter","vf":"<single ffmpeg video filter expression>","label":"short description"} — e.g. "eq=hue=0.2" for a hue shift, "vignette", "fade=t=in:st=0:d=1", "colorlevels=rimin=0.1", "curves=vintage", "chromashift", "tweak=hs=20", "hue=s=1.3", "crops" only via trim/aspect. The expression must be ONE filter or comma-joined filters, using only ffmpeg syntax (no quotes, no backslashes, no file paths).
 {"kind":"afilter","af":"<single ffmpeg audio filter expression>","label":"short description"} — e.g. "bass=g=8", "aecho=0.8:0.7:60:0.5", "highpass=f=200", "compand". Same syntax restrictions.
+Additionally you may emit STRUCTURED TOOL calls for timeline, analysis and python-engine work: {"kind":"tool","name":"<tool>","args":{…}}. Always fill args exactly as documented: {"name":..., "args":{"key":"value"}}. The tools available are:
+$TOOLCATALOG
+Tool calls work on the job's real timeline (multi-track, non-destructive). Prefer tool ops when: (a) the request needs analysis first (detect_scenes / detect_beats / transcribe_audio / analyze_video / extract_frames / analyze_audio), (b) the user talks about tracks, clips, order or the timeline, (c) request needs overlays on the TIMELINE (add_text_overlay / add_image_overlay / add_sticker / add_lottie / add_animation / add_transition), or (d) they ask to re-render the whole timeline (render_timeline). For plain whole-clip ffmpeg effects keep using the ffmpeg ops above. Chain multiple tool calls in one message when the request needs them (e.g. detect_scenes → trim via trim_clip with the scene time).
 Do not use file-based filters (drawtext with fontfile, subtitles, movie, amovie, opencl, overlay with images) — text overlays are handled by the built-in text op. Prefer the specific ops above when they fit; use filter/afilter only for effects they don't cover. You may chain multiple edits in one message.
 When images are attached to the user's message they are frames sampled across the clip in order (first image = start of the clip, last = end). Use them to understand what actually happens in the video: for suggestions ("what edits would suit this?"), reference specific things you can see (subject, scene changes, framing, lighting, text already on screen). Never describe moments you cannot see in the frames or infer from metadata. When the user asks for the most engaging part, pick the segment(s), and prefer concrete ops (e.g. a trim keeping the liveliest frames) over vague advice.`
+
+// tool ops expand the catalog into the prompt (cached — built once per boot)
+let _catalogHintCache = null
+function toolCatalogHint() {
+  if (_catalogHintCache == null) {
+    try {
+      _catalogHintCache = catalogHint()
+    } catch (e) {
+      _catalogHintCache = '(tool catalog unavailable: ' + e.message.slice(0, 80) + ')'
+    }
+  }
+  return SYSTEM_PROMPT.replace('$TOOLCATALOG', _catalogHintCache)
+}
 
 const FILTER_SAFE = /^[A-Za-z0-9 _=:/.,()+?*%!-]{0,500}$/
 const FILTER_BLOCKED = /\b(file|protocol|opencl|movie|amovie|subtitles|drawtext|overlay|lavfi|protected|stdin|stdout)\b/i
@@ -424,7 +505,7 @@ function safeFilter(s) {
   return s
 }
 
-const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur', 'filter', 'afilter', 'chat'])
+const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur', 'preset', 'filter', 'afilter', 'tool', 'chat'])
 
 // --- LLM providers -------------------------------------------------------------
 // Message `content` may be a plain string OR an array of typed parts for
@@ -681,6 +762,7 @@ function validOp(o, hasAudio) {
     case 'scale': return F(o.height) && +o.height > 0 && +o.height <= 8640
     case 'aspect': return F(o.rx) && F(o.ry) && +o.rx > 0 && +o.ry > 0
     case 'text': return String(o.text || '').trim().length > 0
+    case 'tool': return !!getTool(o.name || o.tool) // unknown tool names are dropped early
     case 'gif': return o.fps == null || +o.fps > 0 // clamped further in the loop
     case 'afilter': return hasAudio // nothing to filter on a muted/video-only clip
     default: return true // trim/mute/eq/filter/etc. are validated (or dropped) in the loop below
@@ -739,6 +821,15 @@ function normalizeOps(parsed, mediaInfo) {
     } else if (o.kind === 'afilter') {
       const f = safeFilter(o.af || o.value || o.filter)
       if (f) { o.af = f; o.kind = 'afilter'; o.label = o.label || f.split('=')[0] } else o.kind = null
+    } else if (o.kind === 'tool') {
+      const t = getTool(o.name || o.tool)
+      if (!t) o.kind = null
+      else {
+        o.name = t.name
+        o.args = (o.args && typeof o.args === 'object' && !Array.isArray(o.args)) ? JSON.parse(JSON.stringify(o.args)) : {}
+        for (const k of Object.keys(o.args)) if (!/^[\w-]{1,24}$/.test(k)) delete o.args[k]
+        o.label = `tool ${t.name}`
+      }
     }
     if (o.kind === null) o._drop = true
     if (o.kind && !o.label) o.label = label
@@ -752,7 +843,7 @@ async function understandWithLLM(message, meta, history, frames) {
   const videoInfo =
     `Video is ${meta.duration}s, ${meta.width}x${meta.height}, ${meta.hasAudio ? 'has audio' : 'no audio'}, ${meta.fps || '?'}fps.` +
     (frames?.length ? ` ${frames.length} sample frames are attached (in clip order).` : '')
-  const system = SYSTEM_PROMPT + ' ' + videoInfo
+  const system = toolCatalogHint() + ' ' + videoInfo
   const msgs = [...history.slice(-8), { role: 'user', content: message }]
   const p = activeProvider()
   if (!p) return null

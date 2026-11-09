@@ -413,3 +413,24 @@ test('normalizeTranscriptCues: survives garbage input', () => {
   assert.deepEqual(normalizeTranscriptCues('nope', META), [])
   assert.deepEqual(normalizeTranscriptCues([42, {}], META), [])
 })
+
+test('understand: platform canvas for tiktok, not for "shorter"', () => {
+  const has = understand('make it a vertical canvas for tiktok', META)
+  assert.ok(has.ops.some((o) => o.kind === 'preset'))
+  const no = understand('make it 5 seconds shorter', META)
+  assert.ok(!no.ops.some((o) => o.kind === 'preset'))
+})
+
+test('build: preset letterboxes onto the 9:16 canvas', () => {
+  const f = build([{ kind: 'preset', label: 'canvas', w: 1080, h: 1920, blur: false }], META, null)
+  assert.ok(f.complex === null)
+  assert.ok(f.vf.some((v) => v.includes('scale=1080:1920:force_original_aspect_ratio=decrease')))
+  assert.ok(f.vf.some((v) => v.includes('pad=1080:1920:')))
+})
+
+test('build: preset blur variant builds a split/overlay graph', () => {
+  const f = build([{ kind: 'preset', label: 'canvas blur', w: 1080, h: 1920, blur: true }], META, null)
+  assert.match(f.complex, /split=2\[bg\]\[fg\]/)
+  assert.match(f.complex, /boxblur=20:2/)
+  assert.match(f.complex, /overlay=\(W-w\)\/2:\(H-h\)\/2/)
+})
