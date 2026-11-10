@@ -67,7 +67,15 @@ function mkClip(spec) {
   if (Number.isFinite(scaleOk) && scaleOk > 0 && scaleOk <= 10) c.scale = round6(scaleOk)
   const opOk = +spec.opacity
   if (Number.isFinite(opOk) && opOk >= 0 && opOk <= 1) c.opacity = round6(opOk)
-  if (spec.color && /^#\w{3,8}$/.test(String(spec.color))) c.color = String(spec.color)
+  const colorVal = typeof spec.color === 'string' ? spec.color.trim() : ''
+  const namedColor = {
+    black: '#000000', blue: '#0000FF', cyan: '#00FFFF', gold: '#FFD700', gray: '#808080', green: '#00FF00', grey: '#808080',
+    lime: '#00FF00', magenta: '#FF00FF', orange: '#FFA500', pink: '#FFC0CB', purple: '#800080', red: '#FF0000', teal: '#008080',
+    white: '#FFFFFF', yellow: '#FFFF00',
+  }
+  if (colorVal && (/^#\w{3,8}$/.test(colorVal) || namedColor[colorVal.toLowerCase()])) {
+    c.color = /^#/.test(colorVal) ? colorVal.toUpperCase() : namedColor[colorVal.toLowerCase()]
+  }
   const sizeOk = Math.round(+spec.size)
   if (Number.isFinite(sizeOk) && sizeOk >= 8 && sizeOk <= 400) c.size = sizeOk
   if (typeof spec.text === 'string' && spec.text) c.text = spec.text.slice(0, 200)

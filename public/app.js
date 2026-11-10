@@ -746,9 +746,42 @@ function addMsg(role, html, isError) {
   const el = document.createElement('div')
   el.className = 'msg ' + role + (isError ? ' error' : '')
   el.innerHTML = html
+  addCopyBtns(el)
   chat.appendChild(el)
   chat.scrollTop = chat.scrollHeight
   return el
+}
+
+// wrap every `code` block with a copy button (ffmpeg commands etc.)
+function addCopyBtns(el) {
+  el.querySelectorAll('code').forEach(code => {
+    if (code.parentElement && code.parentElement.classList.contains('cwrap')) return
+    const wrap = document.createElement('div')
+    wrap.className = 'cwrap'
+    const btn = document.createElement('button')
+    btn.className = 'copybtn'
+    btn.type = 'button'
+    btn.textContent = '⧉ copy'
+    btn.setAttribute('aria-label', 'copy code to clipboard')
+    btn.addEventListener('click', async () => {
+      const text = code.textContent
+      try {
+        await navigator.clipboard.writeText(text)
+      } catch {
+        const ta = document.createElement('textarea') // clipboard API can be blocked
+        ta.value = text
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        ta.remove()
+      }
+      btn.textContent = '✓ copied'
+      setTimeout(() => { btn.textContent = '⧉ copy' }, 1500)
+    })
+    code.replaceWith(wrap)
+    wrap.appendChild(code)
+    wrap.appendChild(btn)
+  })
 }
 
 function md(text) {

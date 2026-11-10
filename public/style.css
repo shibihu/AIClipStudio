@@ -182,6 +182,16 @@ main {
   overflow-x: auto; white-space: pre; margin-top: 6px;
 }
 .msg .ops { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+.msg .cwrap { position: relative; margin-top: 6px; }
+.msg .cwrap code { margin-top: 0; padding-right: 70px; }
+.msg .copybtn {
+  position: absolute; top: 6px; right: 6px;
+  background: #131722; color: var(--muted, #8b93a7);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 2px 9px; font-size: 11px; cursor: pointer;
+  opacity: 0.75; transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+}
+.msg .copybtn:hover { opacity: 1; color: #fff; border-color: #4b6cf5; }
 .msg.error { border-color: #6b2d3a; }
 
 .chips {

@@ -46,6 +46,36 @@ def timeline_from_otio(payload):
     return {"timeline": otio_bridge.otio_json_to_timeline(doc)}
 
 
+def health_check(_payload):
+    mods = {}
+    for name, gate in [("moviepy", video_ops.moviepy_gate),
+                       ("cv2", vision_ops.cv_gate),
+                       ("PIL", image_ops.pil_gate),
+                       ("lottie", image_ops.lottie_gate),
+                       ("librosa", audio_ops.lb_gate),
+                       ("faster_whisper", stt_ops.fw_gate)]:
+        try:
+            mods[name] = {"available": gate.available(), "version": _ver(name)}
+        except Exception as e:  # pragma: no cover
+            mods[name] = {"available": False, "error": str(e)[:160]}
+    mods["opentimelineio"] = {
+        "available": otio_bridge.OTIO_AVAILABLE,
+        "error": otio_bridge.OTIO_IMPORT_ERROR,
+        "version": _ver("opentimelineio") if otio_bridge.OTIO_AVAILABLE else None,
+    }
+    return {"service": "aiclipstudio-py", "version": 1, "modules": mods,
+            "endpoints": sorted(ENDPOINTS)}
+
+
+def _ver(name):
+    try:
+        import importlib
+        m = importlib.import_module(name if name != "PIL" else "PIL")
+        return getattr(m, "__version__", None)
+    except Exception:
+        return None
+
+
 ENDPOINTS = {
     # health / introspection
     "health": health_check,
@@ -84,34 +114,7 @@ ENDPOINTS = {
 }
 
 
-def health_check(_payload):
-    mods = {}
-    for name, gate in [("moviepy", video_ops.moviepy_gate),
-                       ("cv2", vision_ops.cv_gate),
-                       ("PIL", image_ops.pil_gate),
-                       ("lottie", image_ops.lottie_gate),
-                       ("librosa", audio_ops.lb_gate),
-                       ("faster_whisper", stt_ops.fw_gate)]:
-        try:
-            mods[name] = {"available": gate.available(), "version": _ver(name)}
-        except Exception as e:  # pragma: no cover
-            mods[name] = {"available": False, "error": str(e)[:160]}
-    mods["opentimelineio"] = {
-        "available": otio_bridge.OTIO_AVAILABLE,
-        "error": otio_bridge.OTIO_IMPORT_ERROR,
-        "version": _ver("opentimelineio") if otio_bridge.OTIO_AVAILABLE else None,
-    }
-    return {"service": "aiclipstudio-py", "version": 1, "modules": mods,
-            "endpoints": sorted(ENDPOINTS)}
 
-
-def _ver(name):
-    try:
-        import importlib
-        m = importlib.import_module(name if name != "PIL" else "PIL")
-        return getattr(m, "__version__", None)
-    except Exception:
-        return None
 
 
 class Handler(BaseHTTPRequestHandler):

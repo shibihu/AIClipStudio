@@ -41,6 +41,28 @@ function atempoChain(rate) {
   return stages
 }
 
+const TEXT_COLORS = {
+  black: '#000000', blue: '#0000FF', cyan: '#00FFFF', gold: '#FFD700',
+  gray: '#808080', green: '#00FF00', grey: '#808080', lime: '#00FF00',
+  magenta: '#FF00FF', orange: '#FFA500', pink: '#FFC0CB', purple: '#800080',
+  red: '#FF0000', teal: '#008080', white: '#FFFFFF', yellow: '#FFFF00',
+}
+
+function normalizeTextColor(value) {
+  const s = String(value || '').trim().toLowerCase()
+  if (!s) return 'white'
+  if (/^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(s)) return s.toUpperCase()
+  if (TEXT_COLORS[s]) return TEXT_COLORS[s]
+  const key = s.replace(/[-_\s]+/g, '')
+  const match = Object.keys(TEXT_COLORS).find((name) => name.replace(/[-_\s]+/g, '') === key)
+  return match ? TEXT_COLORS[match] : '#FFFFFF'
+}
+
+function assColor(value) {
+  const hex = normalizeTextColor(value).replace(/^#/, '').toUpperCase()
+  return `&H00${hex}`
+}
+
 // Returns { ops:[...], unknown:{bool}, clarify:{bool}, summary:string }
 function understand(message, meta) {
   const s = (message || '').toLowerCase().trim()
@@ -200,13 +222,14 @@ function understand(message, meta) {
       let pos = 'center'
       if (/(top|upper)/.test(s)) pos = 'top'
       if (/(bottom|lower)/.test(s)) pos = 'bottom'
+      const colorMatch = Object.keys(TEXT_COLORS).find((name) => new RegExp(`\\b${name}\\b`).test(s)) || 'white'
       let size = 40
       if (/huge|giant/.test(s)) size = 72
       else if (/\b(?:big|large)\b/.test(s)) size = 52
       else if (/(small|tiny)/.test(s)) size = 26
       const sm = s.match(/(\d{2,3})\s*(?:px|pt|point|font)/)
       if (sm) size = parseInt(sm[1], 10)
-      ops.push({ kind: 'text', label: `overlay text "${raw.slice(0, 36)}" (${pos})`, text: raw, pos, size, color: 'white' })
+      ops.push({ kind: 'text', label: `overlay text "${raw.slice(0, 36)}" (${pos})`, text: raw, pos, size, color: colorMatch })
     }
   }
 
@@ -389,6 +412,7 @@ function makeTextOverlay(ops, meta, dir, duration) {
     // overwrite each other's overlay
     const name = `overlay-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}-${++i}.ass`
     const end = (pos === 'center') ? 36000 : (duration || 36000) // top/bottom: as long as possible pairs with trim
+    const primaryColour = assColor(op.color || 'white')
     const ass = `[Script Info]
 ScriptType: v4.00+
 PlayResX: ${w}
@@ -397,7 +421,7 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
-Style: A,DejaVu Sans,${Math.round(size)},&H00FFFFFF,&H00101010,&H64000000,1,3,1,${align[pos]},${Math.round(w * 0.06)},${Math.round(w * 0.06)},${Math.round(h * 0.07)},1,1
+Style: A,DejaVu Sans,${Math.round(size)},${primaryColour},&H00101010,&H64000000,1,3,1,${align[pos]},${Math.round(w * 0.06)},${Math.round(w * 0.06)},${Math.round(h * 0.07)},1,1
 
 [Events]
 Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text

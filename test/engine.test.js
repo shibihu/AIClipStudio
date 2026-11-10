@@ -112,6 +112,15 @@ test('understand: text overlay with quotes, position and size', () => {
   assert.equal(t.size, 52)
 })
 
+test('understand: yellow text in the middle of the clip', () => {
+  const r = understand('Add yellow color text in the middle of the clip showing "Skibidi"', META)
+  const t = r.ops.find((o) => o.kind === 'text')
+  assert.equal(t.text, 'Skibidi')
+  assert.equal(t.pos, 'center')
+  assert.equal(t.color, 'yellow')
+  assert.equal(t.size, 40)
+})
+
 test('understand: chained edits in one message', () => {
   const r = understand("cut the first 3 seconds, make it square, add text 'HI'", META)
   const kinds = r.ops.map((o) => o.kind)
