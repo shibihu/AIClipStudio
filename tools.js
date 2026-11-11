@@ -413,6 +413,84 @@ function toolExtractFrames(ctx, { asset, src, count = 8, outputDir }) {
   return ctx.py('cv/frames', { input: file, count, outDir, prefix: 'f' })
 }
 
+// --- caption replacement (CaptionRemovalEngine, py/caption_ops.py) ------------
+
+function mainVideoClip(ctx) {
+  const tr = mainVideoTrack(ctx.tl)
+  return tr.clips && tr.clips[tr.clips.length - 1]
+}
+
+function toolDetectExistingCaptions(ctx, a) {
+  const file = fileRef(ctx.dir, a.asset || a.src || ctx.meta.versionName)
+  const res = ctx.py('captions/detect', {
+    input: file,
+    useOcr: a.useOcr !== false,
+    ...(a.manual ? { manual: a.manual } : {}),
+  }, 600000)
+  return {
+    regions: (res.regions || []).map((r) => ({
+      start: r.start, end: r.end, x: r.x, y: r.y, width: r.width, height: r.height,
+      confidence: r.confidence, samples: r.samples,
+    })),
+    count: res.count,
+    width: res.width, height: res.height,
+    band: res.band,
+    ocr: res.ocr,
+    note: 'regions are pixel coords in the source resolution; xN/yN/wN/hN are the same boxes normalized 0..1',
+  }
+}
+
+function toolRemoveCaptionRegions(ctx, a) {
+  // detection is mandatory: never blur the whole frame as a silent fallback
+  const regions = Array.isArray(a.regions) && a.regions.length ? a.regions : []
+  if (!regions.length) {
+    throw new Error('remove_caption_regions needs regions from detect_existing_captions ' +
+      '(or explicit regions:[]) — never runs a blind full-frame fallback')
+  }
+  const method = ['blur', 'gaussian', 'solid', 'inpaint'].includes(a.method) ? (a.method === 'gaussian' ? 'blur' : a.method) : 'blur'
+  const clampRegion = (r) => ({
+    start: Math.max(0, +r.start || 0), end: Math.max(0.1, +r.end || 0.1),
+    x: Math.max(0, Math.round(+r.x || 0)), y: Math.max(0, Math.round(+r.y || 0)),
+    width: Math.max(4, Math.round(+r.width || 4)), height: Math.max(4, Math.round(+r.height || 4)),
+    confidence: +r.confidence || 0.75,
+  })
+  const eff = { type: 'caption_remove', method, radius: Math.max(2, Math.min(40, Math.round(+a.radius || 14))), regions: regions.map(clampRegion), lowConfFailsafe: a.lowConfFailsafe !== false }
+  return toolAddEffect(ctx, { clipId: a.clipId || (mainVideoClip(ctx) || {}).id, effect: eff })
+}
+
+function toolReplaceExistingSubtitles(ctx, a) {
+  // full pipeline: detect → (optional transcript) → translate → region remove
+  // → Thai ASS burn → audio copy. Server expands the effect at render/chat.
+  const language = String(a.language || 'th').slice(0, 2).toLowerCase()
+  const method = ['blur', 'gaussian', 'solid', 'inpaint'].includes(a.method) ? a.method : 'blur'
+  const eff = {
+    type: 'caption_replace', language, method,
+    radius: Math.max(2, Math.min(40, Math.round(+a.radius || 14))),
+    manual: a.manual && typeof a.manual === 'object' ? a.manual : null,
+  }
+  return toolAddEffect(ctx, { clipId: a.clipId || (mainVideoClip(ctx) || {}).id, effect: eff })
+}
+
+function toolGenerateTranslatedSubtitles(ctx, a) {
+  // records the translation intent + language; the server chat pipeline does
+  // the LLM translation and builds the timed .ass (timing comes from STT)
+  const language = String(a.language || 'th').slice(0, 2).toLowerCase()
+  const eff = { type: 'translated_subtitles', language, source: a.source || 'stt' }
+  return toolAddEffect(ctx, { clipId: a.clipId || (mainVideoClip(ctx) || {}).id, effect: eff })
+}
+
+function toolValidateCaptionReplacement(ctx, a) {
+  const before = fileRef(ctx.dir, a.before || ctx.meta.versionName)
+  const after = fileRef(ctx.dir, a.after)
+  if (!after) throw new Error('validate_caption_replacement needs "after" (the rendered output name)')
+  const res = ctx.py('captions/validate', { before, after, regions: a.regions || [] }, 300000)
+  return {
+    ok: res.ok, checks: res.checks, inside_avg: res.inside_avg,
+    outside_avg: res.outside_avg, samples: res.samples,
+    note: 'regions_changed=false → removal did not land; outside_unchanged=false → frame damaged elsewhere',
+  }
+}
+
 // --- render ---------------------------------------------------------------------
 
 function toolRenderTimeline(ctx, { wait = true } = {}) {
@@ -491,6 +569,17 @@ const CATALOG = [
 
   T('export_timeline', 'timeline', 'serialize the timeline as OpenTimelineIO JSON', { path: 'str?' }, toolExportTimeline),
   T('import_timeline', 'timeline', 'load an OTIO JSON string into the internal timeline', { otio: 'str|obj' }, toolImportTimeline),
+
+  T('detect_existing_captions', 'captions', 'CaptionRemovalEngine: find burned-in subtitle boxes (OpenCV + optional OCR refine); returns regions {start,end,x,y,width,height,confidence}',
+    { asset: 'str?', useOcr: 'bool?', manual: '{x:int,y:int,w:int,h:int}?' }, toolDetectExistingCaptions),
+  T('remove_caption_regions', 'captions', 'remove ONLY the detected caption regions (blur/gaussian/solid/inpaint); never a full-frame fallback — regions come from detect_existing_captions',
+    { regions: 'list', method: 'blur|gaussian|solid|inpaint?', radius: 'int?', clipId: 'str?' }, toolRemoveCaptionRegions),
+  T('generate_translated_subtitles', 'captions', 'translate the spoken transcript (stt) into subtitles; timing follows the original voiceover',
+    { language: 'ISO code (th default)', source: 'stt?', clipId: 'str?' }, toolGenerateTranslatedSubtitles),
+  T('replace_existing_subtitles', 'captions', 'full pipeline: remove existing burned-in captions AND burn translated subtitles timed to the original speech; original audio copied untouched',
+    { language: 'ISO code (th default)', method: 'blur|gaussian|solid|inpaint?', radius: 'int?', manual: '{x,y,w,h}?', clipId: 'str?' }, toolReplaceExistingSubtitles),
+  T('validate_caption_replacement', 'captions', 'verify the render: caption regions changed, rest of frame intact, audio still present',
+    { after: 'str (output file name)', before: 'str?', regions: 'list?' }, toolValidateCaptionReplacement),
 ]
 
 const NAMES = new Map(CATALOG.map((t) => [t.name, t]))

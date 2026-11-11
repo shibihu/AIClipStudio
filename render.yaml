@@ -3,12 +3,26 @@
 # Deploy: push this repo, then Render Dashboard → New → Blueprint → pick the repo.
 #
 # Notes:
-#   • No npm dependencies — nothing to install; `npm ci` is skipped on purpose.
 #   • Static ffmpeg builds are committed per-arch (ffmpeg-amd64 for Render,
 #     ffmpeg-arm64 for local dev) — no apt installs needed on the runtime.
+#     The static build includes libass + the subtitles filter (verified:
+#     `ffmpeg -filters | grep subtitles`) and vendor/fonts/ carries
+#     NotoSansThai-Bold.ttf, so Thai subtitle burn-in works with zero
+#     runtime installs (fontsdir=vendor/fonts is passed to the filter).
+#   • The caption pipeline needs the python service: buildCommand creates
+#     .venv and installs py/requirements.txt (opencv, faster-whisper,
+#     rapidocr-onnxruntime for OCR refine, ...). server.js boots
+#     py/service.py automatically; if the venv is missing the service is
+#     skipped and /api/health reports exactly which modules degraded.
 #   • A persistent disk keeps uploaded projects (jobs/) across deploys.
-#     Disks require a paid instance — delete the `disk:` block for the free plan
-#     (job history will reset on every deploy/restart).
+#     Disks require a paid instance — delete the `disk:` block for the free
+#     plan (job history will reset on every deploy/restart).
+#   • OCR + whisper models are lazy downloads at first use (~15 MB OCR,
+#     whisper per chosen size) — point AICLIP_WHISPER_CACHE at the disk so
+#     they survive restarts.
+#   • 0.5c-512mb is tight for whisper `small`+OCR on long clips; use `tiny`
+#     or `base` (CAPTION_STT_MODEL) on small plans. Media renders are
+#     memory-bound, not openCV-bound: detection caps at 4 fps sampling.
 #   • Set one AI key in the service's Environment settings — never commit real
 #     keys. Supported: GEMINI_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY,
 #     GROQ_API_KEY, OPENCODE_API_KEY, ANTHROPIC_API_KEY.
@@ -21,7 +35,13 @@ services:
     autoDeployTrigger: commit  # redeploy on every `git push` to the branch below
     region: singapore        # options: oregon | ohio | virginia | frankfurt | singapore
     branch: main
-    buildCommand: chmod +x vendor/ffmpeg-* vendor/ffprobe-* || true
+    # caption pipeline needs the python service (detection/STT/validate) —
+    # its deps install from py/requirements.txt into .venv before boot
+    buildCommand: |
+      set -e
+      chmod +x vendor/ffmpeg-* vendor/ffprobe-* || true
+      python3 -m venv .venv 2>/dev/null || true
+      ./.venv/bin/pip install -q -r py/requirements.txt
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:
@@ -29,6 +49,10 @@ services:
         value: "22"
       - key: PORT
         value: "10000"
+      - key: PY_SERVICE_PORT
+        value: "8611"
+      - key: AICLIP_WHISPER_CACHE
+        value: /var/data/whisper-cache
       - key: AUTH_TOKEN
         sync: false          # Render will prompt you (leave empty for open access)
       - key: GEMINI_API_KEY

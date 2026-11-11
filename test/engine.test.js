@@ -10,6 +10,7 @@ const assert = require('node:assert/strict')
 const {
   understand, build, safeFilter, normalizeOps, extractJson,
   buildCues, placeCues, normalizeTranscriptCues,
+  selectedSkillsContext, captionPrompt,
 } = require('../ai')
 
 const META = { duration: 20, width: 1280, height: 720, hasAudio: true, fps: 30 }
@@ -442,4 +443,26 @@ test('build: preset blur variant builds a split/overlay graph', () => {
   assert.match(f.complex, /split=2\[bg\]\[fg\]/)
   assert.match(f.complex, /boxblur=20:2/)
   assert.match(f.complex, /overlay=\(W-w\)\/2:\(H-h\)\/2/)
+})
+
+// --- Native Android Skills → planner context (FirstMobileApp contract) --------
+
+test('selected Skill context includes supported IDs and ignores unknown IDs', () => {
+  const context = selectedSkillsContext(['automatic_subtitles', 'scene_detection', 'not_a_skill'])
+  assert.match(context, /Selected Skill \(automatic_subtitles\)/)
+  assert.match(context, /detect_scenes tool/)
+  assert.doesNotMatch(context, /not_a_skill/)
+})
+
+test('selected Skill context: voice_cleanup references real audio ops only', () => {
+  const context = selectedSkillsContext(['voice_cleanup'])
+  assert.match(context, /Selected Skill \(voice_cleanup\)/)
+  // must not invent a dedicated voice tool that does not exist
+  assert.doesNotMatch(context, /voice_tool|voiceTool/)
+})
+
+test('caption prompt accepts bounded language/style instructions and defaults unchanged', () => {
+  assert.match(captionPrompt(), /Keep the original language/)
+  assert.match(captionPrompt('Translate to Thai and keep cues concise'), /Translate to Thai and keep cues concise/)
+  assert.ok(captionPrompt('x'.repeat(1200)).length < captionPrompt('x'.repeat(1000)).length + 1)
 })

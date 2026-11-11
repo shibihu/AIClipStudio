@@ -2,6 +2,7 @@
 # Every op reads the SOURCE file and writes a NEW file; the original media is
 # never touched. Errors surface as ApiError with short client-safe messages.
 from common import ApiError, ModuleGate, require, safe_out, clamp, envelope
+import os
 
 moviepy_gate = ModuleGate("moviepy")
 
@@ -65,12 +66,16 @@ def trim(d):
 def split(d):
     """{input, outputA, outputB, at} — split at a time point."""
     moviepy_gate.get()
-    src, _ = _io(d)
+    src = d.get("input")
+    if not src:
+        raise ApiError("missing input path")
     outA = safe_out(d.get("outputA") or d.get("output1"))
     outB = safe_out(d.get("outputB") or d.get("output2"))
-    at = clamp(require(d, "at", cast=float, default=0.0) or 0.0, 0.0, 1e9)
+    at = clamp(require(d, "at", cast=float, default=0.0)["at"] or 0.0, 0.0, 1e9)
     if src == outA or src == outB or outA == outB:
         raise ApiError("split outputs must differ from each other and input")
+    if not os.path.isfile(src):
+        raise ApiError(f"missing input file: {src}")
     with _open_video(src) as clip:
         dur = clip.duration
         at = clamp(at, 0.05, dur - 0.05)
@@ -92,7 +97,7 @@ def speed(d):
     """{input, output, rate} — rate>1 faster, rate<1 slower."""
     mp = moviepy_gate.get()
     src, out = _io(d)
-    rate = clamp(require(d, "rate", cast=float, default=1.0) or 1.0, 0.1, 8.0)
+    rate = clamp(require(d, "rate", cast=float, default=1.0)["rate"] or 1.0, 0.1, 8.0)
     if rate == 1.0:
         d2 = dict(d, output=out)
         return trim(d2)
@@ -179,8 +184,8 @@ def add_audio(d):
     audio_src = d.get("audio")
     if not audio_src or audio_src == out:
         raise ApiError("need an 'audio' path distinct from output")
-    start = clamp(require(d, "start", cast=float, default=0.0) or 0.0, 0.0, 1e9)
-    volume = clamp(require(d, "volume", cast=float, default=1.0) or 1.0, 0.0, 4.0)
+    start = clamp(require(d, "start", cast=float, default=0.0)["start"] or 0.0, 0.0, 1e9)
+    volume = clamp(require(d, "volume", cast=float, default=1.0)["volume"] or 1.0, 0.0, 4.0)
     from moviepy import CompositeAudioClip, AudioFileClip
     over = AudioFileClip(audio_src)
     try:
@@ -205,8 +210,8 @@ def fade_audio(d):
     """{input, output, in?, out?} — add fade-in / fade-out on the clip audio."""
     mp = moviepy_gate.get()
     src, out = _io(d)
-    fade_in = clamp(require(d, "fin", cast=float, default=0.5) or 0.5, 0.0, 30.0)
-    fade_out = clamp(require(d, "fout", cast=float, default=0.5) or 0.5, 0.0, 30.0)
+    fade_in = clamp(require(d, "fin", cast=float, default=0.5)["fin"] or 0.5, 0.0, 30.0)
+    fade_out = clamp(require(d, "fout", cast=float, default=0.5)["fout"] or 0.5, 0.0, 30.0)
     with _open_video(src) as clip:
         if clip.audio is None:
             raise ApiError("clip has no audio to fade")
@@ -228,7 +233,7 @@ def change_volume(d):
     """{input, output, factor} — multiply audio volume in place of none."""
     mp = moviepy_gate.get()
     src, out = _io(d)
-    factor = clamp(require(d, "factor", cast=float, default=1.0) or 1.0, 0.0, 8.0)
+    factor = clamp(require(d, "factor", cast=float, default=1.0)["factor"] or 1.0, 0.0, 8.0)
     if factor == 1.0:
         raise ApiError("volume factor 1.0 changes nothing; pick >1 or <1")
     with _open_video(src) as clip:

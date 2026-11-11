@@ -19,6 +19,7 @@ import vision_ops  # noqa: E402
 import image_ops  # noqa: E402
 import audio_ops  # noqa: E402
 import stt_ops  # noqa: E402
+import caption_ops  # noqa: E402
 import otio_bridge  # noqa: E402
 
 HOST = os.environ.get("PY_SERVICE_HOST") or "127.0.0.1"
@@ -53,7 +54,7 @@ def health_check(_payload):
                        ("PIL", image_ops.pil_gate),
                        ("lottie", image_ops.lottie_gate),
                        ("librosa", audio_ops.lb_gate),
-                       ("faster_whisper", stt_ops.fw_gate)]:
+                        ("faster_whisper", stt_ops.fw_gate)]:
         try:
             mods[name] = {"available": gate.available(), "version": _ver(name)}
         except Exception as e:  # pragma: no cover
@@ -63,6 +64,9 @@ def health_check(_payload):
         "error": otio_bridge.OTIO_IMPORT_ERROR,
         "version": _ver("opentimelineio") if otio_bridge.OTIO_AVAILABLE else None,
     }
+    # OCR refine for caption detection is optional — report honestly
+    mods["rapidocr"] = {"available": caption_ops._ocr() is not None,
+                        "version": _ver("rapidocr_onnxruntime")}
     return {"service": "aiclipstudio-py", "version": 1, "modules": mods,
             "endpoints": sorted(ENDPOINTS)}
 
@@ -111,6 +115,10 @@ ENDPOINTS = {
     "stt/start": stt_ops.start,
     "stt/status": stt_ops.status,
     "stt/cleanup": stt_ops.cleanup,
+    # caption removal engine (detection + region removal + validation)
+    "captions/detect": caption_ops.detect,
+    "captions/remove_preview": caption_ops.remove_preview,
+    "captions/validate": caption_ops.validate,
 }
 
 

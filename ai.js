@@ -495,6 +495,16 @@ Allowed edit operation kinds and their fields:
 {"kind":"preset","w":int,"h":int,"blur":true|false} — format to a fixed canvas like the vertical 9:16 1080×1920 (TikTok/Shorts/Reels); blur:true fills the leftover bars with a blurred copy instead of black. Use w=1080,h=1920 for vertical platforms.
 {"kind":"eq","brightness":-0.1..0.1|null,"saturation":0..2|null,"contrast":0.5..2|null}
 {"kind":"blur","radius":int}
+CAPTION/SUBTITLE INTENT — borrowed subtitles burned INTO the video pixels are NOT the same as a full-frame blur. When the mention of "caption", "subtitle", "written text already on the video" appears together with blur/remove/replace/translate:
+{"kind":"detect_caption_regions"} — analysis only: find the burned-in caption boxes.
+{"kind":"remove_existing_captions","method":"blur|gaussian|solid|inpaint","radius":int,"manual":{"x":px,"y":px,"w":px,"h":px}|null} — remove ONLY the detected caption regions; never blur/cover the whole frame. Understand WHICH the user means: "blur the video" = full frame (kind:"blur"); "blur/remove the subtitles/captions" = regions (these ops). If automatic detection is likely uncertain you may pass a manual region from the frames (bottom band of most videos).
+{"kind":"blur_caption_regions","radius":int} — same as remove_existing_captions with method "blur".
+{"kind":"add_translated_subtitles","language":"th"} — translate the SPOKEN lines (transcribe first: emit {"kind":"tool","name":"transcribe_audio"}) into natural <language> subtitles, timestamps matching the original speech, burned as a styled ASS subtitle track. This does NOT remove the burned-in text by itself.
+{"kind":"replace_existing_subtitles","language":"th","method":"blur|inpaint|solid|gaussian","radius":int,"manual":{...}|null} — the full pipeline for requests like "replace the subtitles with Thai": remove the existing burned-in caption regions AND burn translated subtitles timed to the original speech.
+{"kind":"preserve_original_audio"} — STRICT constraint the user's "keep the original voiceover / don't change the audio" maps to; it forbids TTS, audio filters or re-timing. Emit it (or rely on defaults) — the render always copies the original audio stream ("-map 0:a? -c:a copy") when the request mentions keeping audio.
+{"kind":"validate_caption_replacement"} — verification op: checks the regions actually changed and the rest of the frame plus the audio are untouched.
+Example: "remove the English caption by blurring it, and replace with Thai subtitles but keep the original English voiceover" →
+{"ops":[{"kind":"replace_existing_subtitles","language":"th","method":"blur"},{"kind":"preserve_original_audio"}],"summary":"..."}
 For ANY other visual or audio effect express it with a generic filter op so arbitrary user requests still work:
 {"kind":"filter","vf":"<single ffmpeg video filter expression>","label":"short description"} — e.g. "eq=hue=0.2" for a hue shift, "vignette", "fade=t=in:st=0:d=1", "colorlevels=rimin=0.1", "curves=vintage", "chromashift", "tweak=hs=20", "hue=s=1.3", "crops" only via trim/aspect. The expression must be ONE filter or comma-joined filters, using only ffmpeg syntax (no quotes, no backslashes, no file paths).
 {"kind":"afilter","af":"<single ffmpeg audio filter expression>","label":"short description"} — e.g. "bass=g=8", "aecho=0.8:0.7:60:0.5", "highpass=f=200", "compand". Same syntax restrictions.
@@ -529,7 +539,8 @@ function safeFilter(s) {
   return s
 }
 
-const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur', 'preset', 'filter', 'afilter', 'tool', 'chat'])
+const ALLOWED_KINDS = new Set(['trim', 'speed', 'mute', 'volume', 'audioOut', 'mirror', 'vflip', 'rotate', 'aspect', 'scale', 'text', 'gif', 'reverse', 'boomerang', 'fps', 'gray', 'sepia', 'eq', 'blur', 'preset', 'filter', 'afilter', 'tool', 'chat',
+  'remove_existing_captions', 'detect_caption_regions', 'blur_caption_regions', 'add_translated_subtitles', 'preserve_original_audio', 'replace_existing_subtitles', 'validate_caption_replacement'])
 
 // --- LLM providers -------------------------------------------------------------
 // Message `content` may be a plain string OR an array of typed parts for
@@ -554,6 +565,13 @@ const llmHealth = {
 }
 
 function getLlmHealth() { return { ...llmHealth, aiKey: !!activeProvider() } }
+
+// caption.js translation path reuses the active provider's raw call
+function getLlmProvider() {
+  const p = activeProvider()
+  if (!p) return null
+  return { name: p.name, model: p.model, call: (system, msgs, model) => p.call(system, msgs, model) }
+}
 
 function activeProvider() {
   for (const p of PROVIDERS) if (p.key()) return p
@@ -802,7 +820,7 @@ function normalizeOps(parsed, mediaInfo) {
     if (reply) return { isChat: true, reply }
     return null
   }
-  const usable = ops.filter((o) => o.kind !== 'chat').slice(0, 6)
+  const usable = ops.filter((o) => o.kind !== 'chat').slice(0, 12) // multi-step edits (e.g. blur captions → add Thai subs → keep audio) need headroom; 6 silently discarded real intent
   if (!usable.length) return null
   usable.forEach((o) => {
     const label = o.label || o.kind
@@ -854,6 +872,36 @@ function normalizeOps(parsed, mediaInfo) {
         for (const k of Object.keys(o.args)) if (!/^[\w-]{1,24}$/.test(k)) delete o.args[k]
         o.label = `tool ${t.name}`
       }
+    } else if (o.kind === 'replace_existing_subtitles') {
+      // one structured intent the server expands into the full pipeline:
+      // detect → transcribe → translate → blur regions → burn Thai → audio copy
+      o.method = ['blur', 'gaussian', 'solid', 'inpaint'].includes(o.method) ? o.method : 'blur'
+      o.radius = Math.max(2, Math.min(40, Math.round(+o.radius || 14)))
+      o.language = String(o.language || 'th').slice(0, 2).toLowerCase()
+      if (o.manual && typeof o.manual === 'object') {
+        const m = o.manual
+        o.manual = { x: Math.max(0, Math.round(+m.x || 0)), y: Math.max(0, Math.round(+m.y || 0)), w: Math.max(8, Math.round(+m.w || 0)), h: Math.max(8, Math.round(+m.h || 0)) }
+        if (!o.manual.w || !o.manual.h) delete o.manual
+      } else o.manual = null
+      o.label = `replace existing subtitles with ${o.language === 'th' ? 'Thai' : o.language} captions (blur regions, keep original voiceover)`
+    } else if (o.kind === 'remove_existing_captions') {
+      o.method = ['blur', 'gaussian', 'solid', 'inpaint'].includes(o.method) ? o.method : 'blur'
+      o.radius = Math.max(2, Math.min(40, Math.round(+o.radius || 14)))
+      o.label = `remove existing captions (region ${o.method})`
+    } else if (o.kind === 'blur_caption_regions') {
+      o.method = 'blur'
+      o.radius = Math.max(2, Math.min(40, Math.round(+o.radius || 14)))
+      o.label = `blur existing caption regions (radius ${o.radius})`
+    } else if (o.kind === 'detect_caption_regions') {
+      o.label = 'detect existing caption regions'
+    } else if (o.kind === 'preserve_original_audio') {
+      o.enabled = o.enabled !== false
+      o.label = 'keep original voiceover untouched'
+    } else if (o.kind === 'add_translated_subtitles') {
+      o.language = String(o.language || 'th').slice(0, 2).toLowerCase()
+      o.label = `add ${o.language === 'th' ? 'Thai' : o.language} subtitles (synchronized to the original voiceover)`
+    } else if (o.kind === 'validate_caption_replacement') {
+      o.label = 'validate caption replacement'
     }
     if (o.kind === null) o._drop = true
     if (o.kind && !o.label) o.label = label
@@ -863,11 +911,30 @@ function normalizeOps(parsed, mediaInfo) {
   return { ops: final, summary: parsed.summary || final.map((o) => o.label).join(' + '), isLLM: true }
 }
 
-async function understandWithLLM(message, meta, history, frames) {
+// --- Native Android Skills → AI planner context ---------------------------------
+// Selected Skill IDs (allowlisted server-side in server.js) are injected into
+// the planner's SYSTEM context so they steer actual tool selection — they are
+// never concatenated into user-facing text. Descriptions only reference REAL
+// backend capabilities (captions pipeline, audio filter ops, detect_scenes).
+const SKILL_CONTEXT = Object.freeze({
+  automatic_subtitles: 'Automatic subtitles: when the user wants captions/subtitles from speech, run the automatic captions workflow (transcribe → timestamped cues → burned-in render) and do not claim subtitles are complete unless its render succeeds.',
+  voice_cleanup: 'Voice clean-up: use the existing audio ops (volume, afilter with ffmpeg audio filters such as highpass or afftdn) — no separate voice tool exists; do not claim completion unless a render succeeds.',
+  scene_detection: 'Scene detection: use the detect_scenes tool for visual cuts; this is visual scene-cut detection only, never claim semantic highlight ranking.',
+})
+
+// Bounded system-context block for the selected Skills (deduped, max 3).
+function selectedSkillsContext(skills) {
+  if (!Array.isArray(skills)) return ''
+  const selected = [...new Set(skills.map((id) => String(id || '')).filter((id) => Object.hasOwn(SKILL_CONTEXT, id)))].slice(0, 3)
+  return selected.map((id) => `Selected Skill (${id}): ${SKILL_CONTEXT[id]}`).join('\n')
+}
+
+async function understandWithLLM(message, meta, history, frames, selectedSkills = [], workspaceContext = '') {
   const videoInfo =
     `Video is ${meta.duration}s, ${meta.width}x${meta.height}, ${meta.hasAudio ? 'has audio' : 'no audio'}, ${meta.fps || '?'}fps.` +
     (frames?.length ? ` ${frames.length} sample frames are attached (in clip order).` : '')
-  const system = toolCatalogHint() + ' ' + videoInfo
+  const skillsContext = selectedSkillsContext(selectedSkills)
+  const system = [toolCatalogHint(), videoInfo, skillsContext, workspaceContext].filter(Boolean).join('\n')
   const msgs = [...history.slice(-8), { role: 'user', content: message }]
   const p = activeProvider()
   if (!p) return null
@@ -977,9 +1044,10 @@ Rules:
 - start/end are numbers in seconds, relative to the audio start.
 - One cue per natural caption: break at sentence ends or natural pauses, max ~12 words per cue.
 - text contains only the spoken words (no speaker labels, no timestamps inside the text).
-- Keep the original language. If there is no speech, return {"cues":[]}.`
+- Keep the original language unless the user explicitly requests a translation language; translations must preserve the speech timestamps.
+- If there is no speech, return {"cues":[]}.`
 
-async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) {
+async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024, instructions = '' } = {}) {
   const p = activeProvider()
   if (!p || p.name !== 'gemini') return null
   try {
@@ -999,7 +1067,7 @@ async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) 
                 role: 'user',
                 parts: [
                   { inline_data: { mime_type: 'audio/mpeg', data: buf.toString('base64') } },
-                  { text: STT_PROMPT },
+                  { text: captionPrompt(instructions) },
                 ],
               }],
               generationConfig: { temperature: 0.1, maxOutputTokens: 8192, responseMimeType: 'application/json' },
@@ -1031,6 +1099,16 @@ async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) 
     noteLlmError(p.name, e)
     return null
   }
+}
+
+// Bounded caption language/style guidance from POST /api/captions
+// `instructions` (server caps it at 1000 chars). Without instructions the
+// prompt is byte-identical to the previous original-language behavior.
+function captionPrompt(instructions = '') {
+  const requested = String(instructions || '').trim().slice(0, 1000)
+  return requested
+    ? `${STT_PROMPT}\nUser language/style preferences (up to 1000 characters):\n${requested}\nReturn the same JSON cue format.`
+    : STT_PROMPT
 }
 
 // turn raw STT cues into render-ready cue list:
@@ -1069,5 +1147,6 @@ function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxCues = 120 } = 
 module.exports = {
   understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
   buildCues, placeCues, transcribeAudio, normalizeTranscriptCues,
-  getLlmHealth, getLlmInfo, extractJson, safeFilter, normalizeOps,
+  getLlmHealth, getLlmInfo, getLlmProvider, extractJson, safeFilter, normalizeOps,
+  selectedSkillsContext, captionPrompt,
 }

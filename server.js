@@ -47,17 +47,22 @@ const fsp = require('fs/promises')
 const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
-const { execFile, spawn } = require('child_process')
+const { execFile, spawn, execFileSync } = require('child_process')
 const {
   understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
   buildCues, placeCues, transcribeAudio, normalizeTranscriptCues, getLlmHealth, getLlmInfo,
 } = require('./ai')
+const ai = require('./ai') // named above; used by the caption pipeline (provider handoff)
 const timeline = require('./timeline')
 const tools = require('./tools')
+const captions = require('./caption') // "replace existing subtitles" orchestration
+const skillsModule = require('./skills') // Native Android Skills API contract
 
 const ROOT = __dirname
 const PUBLIC = path.join(ROOT, 'public')
 const JOBS = path.join(ROOT, 'jobs')
+// caption detection / whisper transcription / validation budget per chat op
+const PY_CAPTION_TMO = Number(process.env.CAPTION_PY_TIMEOUT_MS) || 600000
 const MAX_UPLOAD = 1024 * 1024 * 1024 // 1 GB
 const RENDER_CONCURRENCY = 1 // serialize renders: one ffmpeg at a time
 
@@ -143,13 +148,30 @@ function pyCall(ep, payload = {}, timeoutMs = 300000) {
     })
 }
 
+function pyInterpreter() {
+  // probe candidates and pick the one that actually has the deps: the system
+  // interpreter often lacks opencv/moviepy while the repo .venv has them (and
+  // vice versa on Termux, where manylinux wheels only install system-wide)
+  const cands = []
+  if (process.env.PYTHON) cands.push(process.env.PYTHON)
+  const venv = path.join(ROOT, '.venv', 'bin', 'python')
+  if (fs.existsSync(venv)) cands.push(venv)
+  if (fs.existsSync('/usr/bin/python3')) cands.push('/usr/bin/python3')
+  cands.push('python3')
+  for (const bin of cands) {
+    try {
+      execFileSync(bin, ['-c', 'import common, cv2, moviepy, audio_ops, vision_ops'],
+        { timeout: 30000, cwd: path.join(ROOT, 'py') })
+      return bin
+    } catch { /* next candidate */ }
+  }
+  return process.env.PYTHON || (fs.existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3')
+}
+
 function startPythonService() {
   if (pySpawned || process.env.PY_SERVICE_DISABLED === '1') return
   pySpawned = true
-  // prefer the system interpreter: the Termux pip uses android_* platform tags
-  // and rejects manylinux wheels, so manylinux-only builds only install under
-  // /usr/bin/python3 (see docs/INTEGRATION.md → Dependency notes)
-  const bin = process.env.PYTHON || (fs.existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3')
+  const bin = pyInterpreter()
   const child = spawn(bin, [path.join(ROOT, 'py', 'service.py')], {
     env: { ...process.env, PY_SERVICE_PORT: String(PY_PORT) },
     stdio: ['ignore', 'inherit', 'inherit'],
@@ -539,6 +561,7 @@ async function syncExternalRenders(job, id) {
     for (const e of entries) {
       if (!MEDIA_EXT.test(e.name) || known.has(e.name)) continue
       if (/^input\./i.test(e.name) || inFlight.has(e.name)) continue // original upload / mid-render output
+      if (/^stt-/i.test(e.name)) continue // caption-pipeline STT side track, not a version
       const abs = path.join(dir, e.name)
       const meta = await probe(abs)
       const thumbName = `thumb-${e.name}.jpg`
@@ -612,14 +635,20 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
   // overlay/b-roll inputs appended after the main input's options; each becomes
   // input index 1..n referenced by the composed filter graph
   for (const rel of frag.overlayInputs || []) args.push('-i', path.join(JOBS, jobId, rel))
-  if (frag.complex) args.push('-filter_complex', frag.complex)
-  else {
+  if (frag.complex) {
+    args.push('-filter_complex', frag.complex)
+    // caption pipeline ends in a labeled [vout]; explicit maps select it plus
+    // the untouched original audio ("-map 0:a? -c:a copy" — never re-encodes
+    // or filters speech when the user keeps the voiceover)
+    if (frag.audioMap) args.push('-map', '[vout]', '-map', frag.audioMap)
+  } else {
     if (frag.vf.length) args.push('-vf', frag.vf.join(','))
     if (frag.af.length) args.push('-af', frag.af.join(','))
   }
   if (frag.output === 'mp4') {
     args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-movflags', '+faststart', '-pix_fmt', 'yuv420p')
-    if (frag.af.length) args.push('-c:a', 'aac', '-b:a', '160k')
+    if (frag.audioEncode) args.push('-c:a', 'aac', '-b:a', '160k')
+    else if (frag.af.length) args.push('-c:a', 'aac', '-b:a', '160k')
     else if (meta.hasAudio && !frag.extraArgs.includes('-an')) args.push('-c:a', 'copy')
   }
   if (frag.output === 'mp3') args.push('-vn')
@@ -1021,6 +1050,9 @@ const server = http.createServer(async (req, res) => {
         auth: !!AUTH_TOKEN,
         renders: { active: activeRuns, queued: renderQueue.length, concurrency: RENDER_CONCURRENCY },
         python: await pyHealth(),
+        // Native Android (FirstMobileApp) Skill API contract — both behaviors
+        // are implemented server-side (skills.js + ai.js planner context).
+        capabilities: skillsModule.HEALTH_CAPABILITIES,
       })
     }
 
@@ -1164,7 +1196,14 @@ const server = http.createServer(async (req, res) => {
 
     // ---- chat / edit ----
     if (p === '/api/chat' && req.method === 'POST') {
-      const { id, message } = await readJson(req)
+      const { id, message, skills = [], context = [] } = await readJson(req)
+      // Native Android Skills API: validate optional `skills` (allowlist) and
+      // `context` (bounded user/assistant turns) before anything else —
+      // invalid payloads get a hard 400 instead of being silently ignored.
+      const skillsErr = skillsModule.validateSkillList(skills)
+      if (skillsErr) return json(res, 400, { error: skillsErr })
+      const contextErr = skillsModule.validateConversationContext(context)
+      if (contextErr) return json(res, 400, { error: contextErr })
       const job = getJob(id)
       if (!job) return json(res, 404, { error: 'unknown job — upload a clip first' })
       const srcName = job.versions[job.base].name
@@ -1207,8 +1246,29 @@ const server = http.createServer(async (req, res) => {
         frames = await extractFrames(path.join(JOBS, id), src, srcName)
       }
       // pass job.msgs as-is: understandWithLLM appends the current user message
-      // itself (passing concat here would send the message to the model twice)
-      let result = await understandWithLLM(message, meta, job.msgs, frames)
+      // itself (passing concat here would send the message to the model twice).
+      // Android may supply bounded context turns; those replace the stored
+      // history for this planner call (skills.js bounds them to 12 × 2000).
+      const history = context.length ? context : job.msgs
+      // planner-side workspace snapshot: the real timeline state the Skills
+      // operate on (markers/clips), capped so the system prompt stays bounded
+      const timelineContext = job.timeline ? {
+        markers: (job.timeline.markers || []).slice(-40),
+        tracks: (job.timeline.tracks || []).map((track) => ({
+          kind: track.kind,
+          name: track.name,
+          clips: (track.clips || []).slice(0, 40).map((clip) => ({
+            name: clip.name,
+            kind: clip.kind,
+            timelineStart: clip.timelineStart,
+            duration: clip.duration,
+          })),
+        })),
+      } : null
+      const workspaceContext = timelineContext
+        ? `Current timeline context (JSON): ${JSON.stringify(timelineContext).slice(0, 6000)}`
+        : ''
+      let result = await understandWithLLM(message, meta, history, frames, skills, workspaceContext)
 
       // LLM chose a conversational answer (question / advice / chit-chat)
       if (result && result.isChat) {
@@ -1260,6 +1320,118 @@ const server = http.createServer(async (req, res) => {
         console.warn(`[ai-studio] chat tool failures (continuing with media ops): ${toolFails.join('; ')}`)
       }
       result.ops = mediaOps
+
+      // ---- caption replacement pipeline ("replace existing subtitles &c") ---
+      // These kinds cannot run through the plain build() path: detection, STT,
+      // translation and the region-treat+ASS graph happen here, then the frag
+      // is enqueued like any other edit. Remaining ordinary ops (trim, speed…)
+      // keep their existing path.
+      const CAPTION_KINDS = new Set(['remove_existing_captions', 'blur_caption_regions', 'replace_existing_subtitles', 'add_translated_subtitles', 'detect_caption_regions', 'validate_caption_replacement', 'preserve_original_audio'])
+      const capOps = result.ops.filter((o) => CAPTION_KINDS.has(o.kind))
+      const plainOps = result.ops.filter((o) => !CAPTION_KINDS.has(o.kind))
+      result.ops = plainOps.length ? plainOps : capOps.length ? [] : result.ops
+      if (capOps.length) {
+        // add_translated_subtitles alone (no removal) → same pipeline, no region effects
+        const replaceOp = capOps.find((o) => o.kind === 'replace_existing_subtitles') || capOps.find((o) => o.kind === 'remove_existing_captions' || o.kind === 'blur_caption_regions')
+        const translateOnly = !replaceOp && capOps.some((o) => o.kind === 'add_translated_subtitles')
+        if (replaceOp || translateOnly) {
+          const op = replaceOp || { kind: 'replace_existing_subtitles', method: 'none', language: (capOps.find((o) => o.kind === 'add_translated_subtitles') || {}).language || 'th', radius: 14, manual: null }
+          if (!replaceOp) {
+            // translation-only: keep OPINION 'none' recorded but no remove stage
+            op.kind = 'replace_existing_subtitles'
+            op.method = 'none'
+            op.translatedOnly = true
+          }
+          try {
+            // ordinary ops that must combine with the caption graph (trim,
+            // speed, eq…) become part of ONE filter graph; complex-only combos
+            // (gif/boomerang/preset canvas) would fight the labeled [vout] —
+            // explicit refusal instead of silently dropping their edit
+            let plainFrag = null
+            if (plainOps.length) {
+              makeTextOverlay(plainOps, meta, path.join(JOBS, id), meta.duration)
+              plainFrag = build(plainOps, meta, FONT)
+              if (plainFrag.complex) {
+                const reply = '🧩 That combination needs two separate renders — first run the caption replacement, then ask for the other edit (its graph owns the whole frame). Nothing was dropped; run them one at a time.'
+                job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+                await saveJob(job, id)
+                return json(res, 200, { reply, commands: [], media: null })
+              }
+            }
+            // whisper/LLM STT gets a small mono side-track; detection uses the
+            // untouched video. Reuse the cached extraction from /api/captions.
+            const audioName = `stt-${srcName.replace(/\W+/g, '_').replace(/_+$/, '')}.mp3`
+            const audioPath = path.join(JOBS, id, audioName)
+            let haveAudio = true
+            try { fs.accessSync(audioPath) } catch { haveAudio = false }
+            if (!haveAudio) {
+              const r = await run(FFMPEG, ['-y', '-hide_banner', '-i', src, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', '-map', 'a:0', audioPath], 300000)
+              if (!r.ok) console.warn('[ai-studio] caption STT audio extraction failed, whisper will try the video directly')
+            }
+            const pipeline = await captions.captionReplacementPipeline({
+              src, meta, dir: path.join(JOBS, id), op, plainFrag,
+              audioSrc: haveAudio ? audioPath : src,
+              pyCall: (ep, payload, tmo) => pyCall(ep, payload, tmo || PY_CAPTION_TMO),
+              provider: ai.getLlmProvider(),
+            })
+            if (pipeline.needInput) {
+              const reply = `🫥 ${pipeline.needInput}\n\nSay it like "blur the captions near the bottom" and if detection is unsure, give me a box — e.g. "the caption area is x 120, y 620, w 1040, h 90".`
+              job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+              await saveJob(job, id)
+              return json(res, 200, { reply, commands: [], media: null })
+            }
+            const frag = pipeline.frag
+            const { rid } = await enqueueRender(job, id, srcName, frag, result, meta, message)
+            const summary = `${op.translatedOnly ? 'added translated subtitles' : op.label}`
+            const reply = `🈶 ${op.translatedOnly ? 'Adding' : 'Replacing with'} ${(op.language || 'th') === 'th' ? 'Thai' : op.language} subtitles — original voiceover copied untouched ⏳` +
+              (pipeline.detection && pipeline.detection.regions && pipeline.detection.regions.length
+                ? ` (${pipeline.detection.regions.length} caption window(s) detected)` : '')
+              + (pipeline.note ? `\nℹ️ ${pipeline.note}` : '')
+            job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: `${reply} (started)` })
+            await saveJob(job, id)
+            return json(res, 200, {
+              reply, summary, ops: frag.desc, commands: [renders.get(rid).cmdDisplay],
+              engine: result.isLLM ? 'llm' : 'local', renderId: rid,
+            })
+          } catch (e) {
+            const reply = '⚠️ Caption replacement failed: ' + String(e.message || e).slice(0, 300)
+            job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+            await saveJob(job, id)
+            return json(res, 200, { reply, commands: [], media: null })
+          }
+        }
+        // standalone detect/validate/preserve ops without a render — answer with data
+        const detectOp = capOps.find((o) => o.kind === 'detect_caption_regions')
+        if (detectOp) {
+          try {
+            const det = await captions.detectRegions(src, { pyCall: (ep2, p2, t2) => pyCall(ep2, p2, t2 || PY_CAPTION_TMO) })
+            const lines = (det.regions || []).slice(0, 12).map((r) =>
+              `• ${r.start}s → ${r.end}s — box x=${r.x} y=${r.y} w=${r.width} h=${r.height} (confidence ${r.confidence})`)
+            const reply = `🔍 Caption detection on the current version — ${det.count || 0} region(s):\n${lines.join('\n') || '(no burned-in captions found in the usual bands)'}\nOCR: ${det.ocr && det.ocr.available ? 'enabled' : 'not installed (pip install rapidocr-onnxruntime for high-confidence text reading)'}` + toTimelineNote(job)
+            job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+            await saveJob(job, id)
+            return json(res, 200, { reply, commands: [], media: null, detection: det.regions && det.regions.slice(0, 20) })
+          } catch (e) {
+            const reply = '⚠️ caption detection failed: ' + String(e.message || e).slice(0, 200)
+            job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+            await saveJob(job, id)
+            return json(res, 200, { reply, commands: [], media: null })
+          }
+        }
+        // preserve_original_audio only → nothing destructive to run; acknowledge
+        if (!plainOps.length && capOps.every((o) => o.kind === 'preserve_original_audio' || o.kind === 'validate_caption_replacement')) {
+          const reply = '✅ Constraint noted: the original voiceover is always copied through ("-map 0:a? -c:a copy") on caption renders — no TTS, no filters, no re-timing. Tell me the edit to run it with.'
+          job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+          await saveJob(job, id)
+          return json(res, 200, { reply, commands: [], media: null })
+        }
+      }
+      result.ops = plainOps
+      if (!result.ops.length) {
+        const reply = "I couldn't turn that into an edit yet. Try phrasing it as an action — e.g. \"remove the first 3 seconds\", \"make it square for tiktok\", \"2x speed\", \"add text 'Good vibes' at the top\", \"make it a gif\", \"mute it\" — or ask \"what can you do?\"" + llmFallbackNote()
+        job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
+        return json(res, 200, { reply, commands: [], media: null })
+      }
 
       // 2) build the ffmpeg pipeline
       if (!meta.hasAudio && mediaOps.some((o) => ['audioOut', 'volume'].includes(o.kind))) {
@@ -1420,7 +1592,12 @@ const server = http.createServer(async (req, res) => {
 
     // ---- captions: paste script → silence-timed burn-in, or auto-transcribe ----
     if (p === '/api/captions' && req.method === 'POST') {
-      const { id, text, auto } = await readJson(req)
+      const { id, text, auto, skill, instructions = '' } = await readJson(req)
+      // Native Android Skills API: the optional stable `automatic_subtitles`
+      // Skill id and bounded language/style `instructions` (≤1000 chars) ride
+      // along; existing website bodies (no new fields) stay unchanged.
+      const capErr = skillsModule.validateCaptionInput(skill, instructions)
+      if (capErr) return json(res, 400, { error: capErr })
       const job = getJob(id)
       if (!job) return json(res, 404, { error: 'unknown job — upload a clip first' })
       const srcName = job.versions[job.base].name
@@ -1451,7 +1628,9 @@ const server = http.createServer(async (req, res) => {
           const r = await run(FFMPEG, ['-y', '-hide_banner', '-i', src, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', '-map', 'a:0', audioPath], 300000)
           if (!r.ok) return json(res, 500, { error: 'audio extraction failed' })
         }
-        const raw = await transcribeAudio(audioPath, meta)
+        // instructions (≤1000 chars, validated above) reach the real Gemini
+        // transcription prompt; cue JSON shape and timestamps stay intact
+        const raw = await transcribeAudio(audioPath, { instructions })
         placed = raw && raw.length ? normalizeTranscriptCues(raw, meta) : null
         if (!placed || !placed.length) {
           console.log(`[ai-studio] auto-captions ${id}: STT returned ${raw ? raw.length : 'no'} cue(s) — falling back to manual script`)
@@ -1461,7 +1640,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, 200, { reply, commands: [], media: null })
         }
         summary = `burned in ${placed.length} auto-transcribed caption${placed.length === 1 ? '' : 's'}`
-        userMsg = '🎙 auto-transcribe and caption the spoken words'
+        userMsg = `🎙 auto-transcribe and caption the spoken words${instructions.trim() ? `\nInstructions: ${instructions.trim()}` : ''}`
       } else {
         // ---- pasted-script path (unchanged behaviour) -------------------------
         const script = String(text || '').slice(0, 5000)

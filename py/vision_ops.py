@@ -41,8 +41,9 @@ def scenes(d):
                 hist = cv.calcHist([hsv], [0, 1], None, [18, 8], [0, 180, 0, 256])
                 cv.normalize(hist, hist, 0, 1, cv.NORM_MINMAX)
                 if prev_hist is not None:
-                    dist = cv.compareHist(prev_hist, hist, cv.HISTCORR_CHISQR_ALT)
-                    # chi-square grows with change; normalize to a 0..1-ish gate
+                    dist = cv.compareHist(prev_hist, hist, cv.HISTCMP_CHISQR_ALT)
+                    # chi-square grows with change; small enough numbers here
+                    # roughly map to a 0..1-ish gate after scaling
                     dist = min(1.0, dist / 50.0)
                     if dist > thr:
                         cuts.append({"time": round(frame_idx / fps, 3),
