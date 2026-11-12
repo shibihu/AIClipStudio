@@ -110,6 +110,7 @@ before(async () => {
       PORT: String(PORT),
       AUTH_TOKEN: '', // open mode for tests (set before .env load wins)
       PY_SERVICE_DISABLED: '1',
+      AICLIP_SINGLETON_DISABLED: '1', // never collide with a developer's running app
       JOBS_TTL_HOURS: '100000', // never clean real job dirs during the test
     },
     stdio: 'ignore',

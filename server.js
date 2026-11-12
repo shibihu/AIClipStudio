@@ -129,14 +129,38 @@ console.log(`[ai-studio] fonts: thai=${FONT_DIAG.thai.family || 'MISSING'} (${FO
   ` | fontconfig=${FONT_DIAG.fontconfigAvailable ? 'yes' : 'no'} | vendored=${FONT_DIAG.vendorFontsExist ? FONT_DIAG.vendorFontsDir : 'no'}`)
 
 // --- python processing service (moviepy / opencv / pillow / librosa / whisper /
-// opentimelineio / lottie). Spawned once on boot; every capability degrades
-// independently — /api/health reports what the python side actually offers. ---
+// opentimelineio / lottie). Started once on boot; every capability degrades
+// independently — /api/health reports what the python side actually offers.
+//
+// Lifecycle is owned by py/service_lifecycle.js. It reuses a healthy service
+// that proves it belongs to THIS installation, never kills a foreign listener,
+// and tracks/terminates only the child this Node process actually spawned.
+const { PythonServiceManager, ApplicationLock, installIdForRoot } = require('./py/service_lifecycle')
+const INSTANCE_ID = crypto.randomUUID()
 const PY_PORT = Number(process.env.PY_SERVICE_PORT) || 8611
+const PY_HOST = process.env.PY_SERVICE_HOST || '127.0.0.1'
+const RUNTIME_DIR = process.env.AICLIP_RUNTIME_DIR || path.join(ROOT, '.runtime')
 const pyCache = new Map() // module gate — prevents double-spawn on overlapping calls
-let pySpawned = false
+let shuttingDown = false
+let shutdownPromise = null
+
+const pythonService = new PythonServiceManager({
+  root: ROOT,
+  host: PY_HOST,
+  port: PY_PORT,
+  runtimeDir: RUNTIME_DIR,
+  instanceId: INSTANCE_ID,
+  python: () => pyInterpreter(),
+})
+const appLock = new ApplicationLock({
+  root: ROOT,
+  runtimeDir: RUNTIME_DIR,
+  port: Number(process.env.PORT) || 3000,
+  instanceId: INSTANCE_ID,
+})
 
 function pyCall(ep, payload = {}, timeoutMs = 300000) {
-  return fetch(`http://127.0.0.1:${PY_PORT}/${ep}`, {
+  return fetch(`http://${PY_HOST}:${PY_PORT}/${ep}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
@@ -173,30 +197,13 @@ function pyInterpreter() {
   return process.env.PYTHON || (fs.existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3')
 }
 
-function startPythonService() {
-  if (pySpawned || process.env.PY_SERVICE_DISABLED === '1') return
-  pySpawned = true
-  const bin = pyInterpreter()
-  const child = spawn(bin, [path.join(ROOT, 'py', 'service.py')], {
-    env: { ...process.env, PY_SERVICE_PORT: String(PY_PORT) },
-    stdio: ['ignore', 'inherit', 'inherit'],
-  })
-  child.on('error', (e) => console.warn(`[ai-studio] python service failed to start (${e.message}) ` +
-    '— moviepy/opencv/librosa/whisper/otio features are degraded this run'))
-  child.on('exit', (code) => {
-    if (code && code !== 0) console.warn(`[ai-studio] python service exited (code ${code})`)
-  })
-}
-
 // quick availability probe used by /api/health and the capability tour
 async function pyHealth() {
-  try {
-    const j = await pyCall('health', {}, 2000)
-    return { up: true, modules: j.modules || {} }
-  } catch (e) {
-    return { up: false, error: e.message }
-  }
+  const status = await pythonService.health()
+  if (!status.up) return { up: false, error: status.error }
+  return { up: true, modules: status.modules || {}, mode: status.mode, pid: status.pid }
 }
+
 
 // make it obvious at boot whether the AI brain (LLM key) is actually wired up
 const AI_INFO = getLlmInfo()
@@ -1005,6 +1012,12 @@ const server = http.createServer(async (req, res) => {
     const p = url.pathname
     const ip = req.socket?.remoteAddress || 'local'
 
+    // stop accepting new work during graceful shutdown
+    if (shuttingDown) {
+      res.setHeader?.('connection', 'close')
+      return json(res, 503, { error: 'server is shutting down' })
+    }
+
     // rate limits run first (even for unauthenticated ticks — cheaper to burn here)
     for (const rule of RATE_RULES) {
       if (rule.match.test(p) && !hitRate(rule, ip)) {
@@ -1777,17 +1790,133 @@ const server = http.createServer(async (req, res) => {
 })
 
 const PORT = process.env.PORT || 3000
-server.listen(PORT, () => {
-  console.log(`\n  🎬 AI Clip Studio  →  http://localhost:${PORT}`)
-  console.log(AUTH_TOKEN
-    ? '[ai-studio] 🔒 access locked by AUTH_TOKEN — enter it in the browser to start'
-    : '[ai-studio] 🔓 no AUTH_TOKEN set — open access (set AUTH_TOKEN in .env to lock)')
-  console.log(`[ai-studio] job cleanup every 30 min, TTL ${Math.round(JOBS_TTL_MS / 3600000)}h | render concurrency: ${RENDER_CONCURRENCY}\n`)
-  startPythonService()
+
+// --- deterministic startup / shutdown ---------------------------------------
+// 1. acquire the installation singleton lock (no two Node instances race for
+//    the same Python service), 2. inspect/reuse-or-start exactly one Python
+//    service, 3. wait for a verified health check, 4. only then serve traffic.
+async function shutdown(reason, exitCode = 0) {
+  if (shutdownPromise) return shutdownPromise
+  shuttingDown = true
+  shutdownPromise = (async () => {
+    // hard stop if a wedged request or child ignores every graceful path
+    const force = setTimeout(() => {
+      console.error(`[ai-studio] shutdown (${reason}) exceeded 20s — forcing exit`)
+      process.exit(exitCode || 1)
+    }, 20000)
+    force.unref()
+
+    if (server.listening) {
+      const closed = new Promise((resolve) => server.close(() => resolve()))
+      try { server.closeIdleConnections?.() } catch { /* older Node */ }
+      const lingering = setTimeout(() => {
+        try { server.closeAllConnections?.() } catch { /* older Node */ }
+      }, 3000)
+      lingering.unref()
+      await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 8000))])
+      clearTimeout(lingering)
+    }
+
+    try {
+      await pythonService.stop(reason)
+    } catch (e) {
+      console.error(`[ai-studio] python shutdown error: ${e.message}`)
+    }
+
+    try {
+      appLock.release()
+    } catch (e) {
+      console.error(`[ai-studio] lock release error: ${e.message}`)
+    }
+
+    clearTimeout(force)
+    return exitCode
+  })()
+  return shutdownPromise
+}
+
+async function bootstrap() {
+  console.log(`[ai-studio] instance ${INSTANCE_ID} | install ${installIdForRoot(ROOT)} | runtime ${RUNTIME_DIR}`)
+  try {
+    await appLock.acquire()
+  } catch (e) {
+    console.error(`[ai-studio] startup aborted: ${e.message}`)
+    process.exit(1)
+  }
+
+  try {
+    const pyStatus = await pythonService.init()
+    if (pyStatus.mode === 'reused') {
+      // reuse log is emitted by the manager; keep the health contract visible
+      console.log(`[ai-studio] python backend ready (shared pid ${pyStatus.pid})`)
+    } else if (pyStatus.status === 'disabled') {
+      console.warn('[ai-studio] python backend disabled — python-only features will return 503')
+    } else {
+      console.log(`[ai-studio] python backend ready (pid ${pyStatus.pid})`)
+    }
+  } catch (e) {
+    console.error(`[ai-studio] python service initialization failed: ${e.message}`)
+    if (process.env.PY_SERVICE_OPTIONAL === '1') {
+      console.warn('[ai-studio] PY_SERVICE_OPTIONAL=1 — continuing with python features unavailable')
+    } else {
+      await shutdown('startup-failure', 1)
+      process.exit(1)
+    }
+  }
+
+  server.on('error', async (e) => {
+    console.error(`[ai-studio] HTTP server error: ${e.message}`)
+    await shutdown('server-error', 1)
+    process.exit(1)
+  })
+
+  server.listen(PORT, () => {
+    console.log(`\n  🎬 AI Clip Studio  →  http://localhost:${PORT}`)
+    console.log(AUTH_TOKEN
+      ? '[ai-studio] 🔒 access locked by AUTH_TOKEN — enter it in the browser to start'
+      : '[ai-studio] 🔓 no AUTH_TOKEN set — open access (set AUTH_TOKEN in .env to lock)')
+    console.log(`[ai-studio] job cleanup every 30 min, TTL ${Math.round(JOBS_TTL_MS / 3600000)}h | render concurrency: ${RENDER_CONCURRENCY}\n`)
+  })
+}
+
+// one handler for every normal stop path; idempotent via shutdownPromise
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    console.log(`\n[ai-studio] ${signal} received — stopping cleanly`)
+    shutdown(signal, 0)
+      .then((code) => process.exit(code))
+      .catch((e) => {
+        console.error(`[ai-studio] shutdown failed: ${e.message}`)
+        process.exit(1)
+      })
+  })
+}
+
+// Never die from a raw stream error (ERR_STREAM_DESTROYED / write-after-end).
+// Log once and shut down through the normal path so Python is not orphaned.
+process.on('uncaughtException', (e) => {
+  console.error('[ai-studio] uncaught exception:', e && e.stack ? e.stack : e)
+  if (shuttingDown) return
+  shutdown('uncaughtException', 1).finally(() => process.exit(1))
 })
+process.on('unhandledRejection', (e) => {
+  console.error('[ai-studio] unhandled rejection:', e && e.stack ? e.stack : e)
+  if (shuttingDown) return
+  shutdown('unhandledRejection', 1).finally(() => process.exit(1))
+})
+process.stdout.on('error', () => { /* broken pipe when the terminal closes */ })
+process.stderr.on('error', () => { /* broken pipe when the terminal closes */ })
+
+bootstrap().catch(async (e) => {
+  console.error(`[ai-studio] fatal startup error: ${e && e.stack ? e.stack : e}`)
+  await shutdown('fatal-startup', 1).catch(() => {})
+  process.exit(1)
+})
+
 setInterval(cleanupJobs, 30 * 60 * 1000).unref()
 cleanupJobs()
 rehydrateRenders()
+
 
 // periodic sweep: ffmpeg runs made outside the app (e.g. pasted into a terminal)
 // register as versions without waiting for the next /api read

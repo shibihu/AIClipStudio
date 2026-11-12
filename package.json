@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/engine.test.js test/caption.test.js test/fonts.test.js test/thai-render.test.js test/skills.test.js",
+    "test": "node --test test/engine.test.js test/caption.test.js test/fonts.test.js test/thai-render.test.js test/skills.test.js test/py-lifecycle.test.js",
     "py:test": "PY_SERVICE_PORT=8621 ./.venv/bin/python py/test_service.py",
     "py:test:captions": "AICLIP_FFMPEG=./vendor/ffmpeg-arm64 ./.venv/bin/python py/test_caption.py",
     "remotion:render": "node scripts/remotion-render.js",
