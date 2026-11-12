@@ -128,8 +128,9 @@ ENDPOINTS = {
 class Handler(BaseHTTPRequestHandler):
     server_version = "AIClipStudioPy/1"
 
-    def log_message(self, fmt, *args):  # quieter: only errors get a line
-        if " 4" in (args[0] if args else "")[:2] or " 5" in (args[0] if args else "")[:2]:
+    def log_message(self, fmt, *args):
+        code = args[0] if args else None
+        if isinstance(code, int) and code >= 400:
             sys.stderr.write("py-service: " + fmt % args + "\n")
 
     def do_GET(self):
