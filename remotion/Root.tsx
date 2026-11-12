@@ -127,7 +127,7 @@ const TextClip: React.FC<{ clip: ClipJSON; relFrame: number; fps: number }> = ({
       top: `${pos[1] * 100}%`,
       transform: 'translate(-50%, -50%)',
       width: '86%', textAlign: 'center',
-      fontFamily: 'DejaVu Sans, sans-serif', fontWeight: 'bold',
+      fontFamily: 'DejaVu Sans, "Noto Sans Thai", sans-serif', fontWeight: 'bold',
       fontSize: size, color: clip.color ?? '#FFFFFF',
       textShadow: '0 2px 6px rgba(0,0,0,.8)', opacity: fade,
       whiteSpace: 'pre-wrap',

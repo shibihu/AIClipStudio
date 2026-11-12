@@ -21,6 +21,7 @@
 const path = require('path')
 const fs = require('fs')
 const ai = require('./ai')
+const fonts = require('./fonts')
 
 const PY_TIMEOUT_MS = Number(process.env.CAPTION_PY_TIMEOUT_MS) || 600000
 
@@ -114,11 +115,13 @@ function assTimestamp(sec) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`
 }
 
-const THAI_FONT_NATIVE = 'Noto Sans Thai'     // font family name inside libass
+const THAI_FONT_NATIVE = 'Noto Sans Thai'     // preferred family name inside libass
 const FONT_FILE = 'NotoSansThai-Bold.ttf'     // vendored: vendor/fonts/
-// Ubuntu base image has no Thai fonts; vendor/fonts/ ships with the repo so
-// both ffmpeg/libass (fontsdir) and Remotion (dir passed at render time) can
-// load it without network or apt installs.
+// The family actually written into the ASS is decided at generation time by
+// fonts.selectFont(): verified Thai glyph coverage first, system fallback
+// next, ThaiFontUnavailableError (never tofu) if nothing covers U+0E00–U+0E7F.
+// vendor/fonts/ ships with the repo so both ffmpeg/libass (fontsdir) and
+// Remotion (dir passed at render time) can load it without network installs.
 
 // Thai has no spaces between words and the vendored ffmpeg/libass build has no
 // ICU/libunibreak line breaking — long cues overflow the frame whatever
@@ -162,10 +165,17 @@ function makeThaiAss(cues, meta, dir) {
   const size = Math.round(Math.min(Math.max(h * 0.055, 22), h * 0.12, 64))
   const margin = Math.round(h * 0.05)
   const marginL = Math.round(w * 0.06)
-  // base-glyph budget per line (~0.55×fontsize advance per base char, checked
-  // against Noto Sans Thai metrics; combining marks excluded from the count)
+  // font from the actual cue texts (verified coverage). Target-language Thai
+  // cues → Noto Sans Thai (or the next Thai-capable family). If translation
+  // failed and the cues stayed English, the same check still picks a Latin
+  // font — one style per file either way.
+  const sel = fonts.selectFont(cues.map((c) => c.text))
+  // base-glyph budget per line (advance per base char relative to fontsize:
+  // Noto Sans Thai ≈0.55, wider Latin faces like DejaVu ≈0.6 — checked against
+  // the vendored fonts' metrics; combining marks excluded from the count)
+  const advance = sel.family === 'DejaVu Sans' || sel.family === 'Noto Sans' || sel.family === 'Liberation Sans' ? 0.6 : 0.55
   const usable = Math.max(120, w - 2 * marginL)
-  const maxUnits = Math.floor(usable / (size * 0.55))
+  const maxUnits = Math.floor(usable / (size * advance))
   const events = cues.map((c) => {
     const lines = wrapThai(c.text, maxUnits).join('\\N')
     return `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},TH,0,0,${margin},,${lines}`
@@ -180,7 +190,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
-Style: TH,${THAI_FONT_NATIVE},${size},&H00FFFFFF,&H00101010,&H00000000,0,3,1,2,${marginL},${marginL},${margin},1,1
+Style: TH,${sel.family},${size},&H00FFFFFF,&H00101010,&H00000000,0,3,1,2,${marginL},${marginL},${margin},1,1
 
 [Events]
 Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
@@ -272,7 +282,10 @@ function composeFfmpegGraph(regionChains, finalLabel, assFile, opts = {}) {
     regionChains = [regionChains[0].replace(/^\[0:v\]/, `[${base}]`), ...regionChains.slice(1)]
   }
   chunks.push(...regionChains)
-  chunks.push(`[${finalLabel}]subtitles='${assFile}':fontsdir=${process.cwd()}/vendor/fonts,setsar=1[vout]`)
+  // fontsdir must be repo-relative via __dirname: process.cwd() breaks when
+  // the server is started from another directory. subtitlesFilter() only
+  // appends the dir when it exists (dangling fontsdir breaks font loading).
+  chunks.push(`[${finalLabel}]${fonts.subtitlesFilter(assFile)},setsar=1[vout]`)
   if (opts.audioChains && opts.audioChains.length) chunks.push(...opts.audioChains)
   return chunks.join(';')
 }
@@ -372,4 +385,5 @@ module.exports = {
   detectRegions, transcribeSpeech, translateCues, makeThaiAss, assTimestamp,
   buildRegionEffects, composeFfmpegGraph, buildCaptionFrag, mergePlainOpsGraph,
   captionReplacementPipeline, validateOutput, THAI_FONT_NATIVE, FONT_FILE,
+  wrapThai, visualWidth,
 }

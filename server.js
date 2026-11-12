@@ -115,6 +115,7 @@ function findFont() {
   } catch { return null }
 }
 const FONT = findFont()
+const fonts = require('./fonts')
 
 let FFMPEG_OK = null
 execFile(FFMPEG, ['-version'], { timeout: 15000 }, (err, stdout) => {
@@ -122,6 +123,10 @@ execFile(FFMPEG, ['-version'], { timeout: 15000 }, (err, stdout) => {
   console.log(err ? `[ai-studio] ffmpeg check FAILED: ${err.message}` : `[ai-studio] ffmpeg OK — ${String(stdout).split('\n')[0]}`)
 })
 console.log(`[ai-studio] ffmpeg: ${FFMPEG}${FONT ? ` | font: ${FONT}` : ' | font: none (text overlays need fontconfig/default font)'}`)
+const FONT_DIAG = fonts.fontDiagnostics()
+console.log(`[ai-studio] fonts: thai=${FONT_DIAG.thai.family || 'MISSING'} (${FONT_DIAG.thai.source || FONT_DIAG.thai.error})` +
+  ` | latin=${FONT_DIAG.latin.family || 'MISSING'} (${FONT_DIAG.latin.source})` +
+  ` | fontconfig=${FONT_DIAG.fontconfigAvailable ? 'yes' : 'no'} | vendored=${FONT_DIAG.vendorFontsExist ? FONT_DIAG.vendorFontsDir : 'no'}`)
 
 // --- python processing service (moviepy / opencv / pillow / librosa / whisper /
 // opentimelineio / lottie). Spawned once on boot; every capability degrades
@@ -722,7 +727,12 @@ async function startRender(reg) {
       return resolve()
     }
     reg.proc = proc
-    const watchdog = setTimeout(resolve, 15 * 60 * 1000) // hard stop at 15 min
+    // hard stop at 15 min — must KILL ffmpeg too, or a hung burn-in keeps the
+    // decoder/encoder (and the render slot) alive forever after we resolve
+    const watchdog = setTimeout(() => {
+      try { proc.kill('SIGKILL') } catch { /* already gone */ }
+      resolve()
+    }, 15 * 60 * 1000)
     proc.on('error', (e) => { errTail = e.message; clearTimeout(watchdog); resolve() })
     proc.stdout.on('data', (d) => {
       if (!reg.expected) return
@@ -746,9 +756,32 @@ async function startRender(reg) {
     proc.on('close', (c) => { code = c === 0 ? 0 : 1; clearTimeout(watchdog); resolve() })
   })
 
+  // Subtitle-pipeline failure diagnosis: turn libass/ffmpeg stderr into an
+  // actionable hint instead of a bare exit code.
+  function classifyRenderFailure(tail) {
+    const t = String(tail || '')
+    if (/fontselect|Fontconfig error|failed to find any fallback|font provider|Cannot find font/i.test(t)) {
+      return 'Font problem: libass could not resolve the subtitle font. Check /api/health → fonts, install Noto Sans Thai (see fonts.js INSTALL_HINTS), then retry.'
+    }
+    if (/ass_read|Could not.*\.ass|Error parsing.*ass|Invalid.*ass\b|Error initializing filter subtitles/i.test(t)) {
+      return 'The generated ASS subtitle file is invalid — the ASS generator, not ffmpeg, is at fault.'
+    }
+    if (/No such file or directory|Unable to open/i.test(t)) {
+      return /subtitles|\.ass/i.test(t)
+        ? 'A subtitle file referenced by the render is missing (deleted temp .ass?). Re-run the edit; generation and burn happen in one pass.'
+        : 'A file referenced by the render is missing.'
+    }
+    if (/Error initializing filter|Error while initializing filter|Invalid argument/i.test(t)) {
+      return 'FFmpeg rejected part of the filter graph.'
+    }
+    return null
+  }
+
   const fail = (reg, errTail) => {
+    const hint = classifyRenderFailure(errTail)
     reg.status = 'failed'
-    reg.reply = `⚠️ The edit failed while rendering:\n\n${errTail || 'unknown ffmpeg error'}\n\nAsk me differently and I'll retry.`
+    reg.reply = `⚠️ The edit failed while rendering:\n\n${errTail || 'unknown ffmpeg error'}\n\nAsk me differently and I'll retry.` +
+      (hint ? `\n\nℹ️ ${hint}` : '')
     sseBroadcast('render', { jobId: reg.jobId, rid: reg.rid, status: 'failed', progress: reg.progress })
   }
   fsp.rm(path.join(JOBS, reg.jobId, 'pending.json'), { force: true }).catch(() => {})
@@ -1049,6 +1082,9 @@ const server = http.createServer(async (req, res) => {
         llm: getLlmHealth(),
         auth: !!AUTH_TOKEN,
         renders: { active: activeRuns, queued: renderQueue.length, concurrency: RENDER_CONCURRENCY },
+        // recomputed per request: after installing a font, health reflects it
+        // without a server restart (fc-list itself stays memoized)
+        fonts: await Promise.resolve(fonts.fontDiagnostics()),
         python: await pyHealth(),
         // Native Android (FirstMobileApp) Skill API contract — both behaviors
         // are implemented server-side (skills.js + ai.js planner context).
@@ -1653,7 +1689,18 @@ const server = http.createServer(async (req, res) => {
         userMsg = `add captions:\n${script.slice(0, 400)}${script.length > 400 ? '…' : ''}`
         captionSource = ` on ${segs.length} detected speech segment${segs.length === 1 ? '' : 's'}`
       }
-      const vf = makeCaptionAss(placed, meta, path.join(JOBS, id))
+      let vf
+      try {
+        // throws ThaiFontUnavailableError when the cues need Thai and no
+        // Thai-capable font is installed — a clean reply, not tofu and not a
+        // half-written response
+        vf = makeCaptionAss(placed, meta, path.join(JOBS, id))
+      } catch (e) {
+        const reply = '⚠️ Could not pick a subtitle font: ' + String(e.message || e).split('\n')[0].slice(0, 300)
+        job.msgs.push({ role: 'user', content: userMsg || 'add captions' }, { role: 'assistant', content: reply })
+        await saveJob(job, id)
+        return json(res, 200, { reply, commands: [], media: null })
+      }
       const frag = { vf: [vf], af: [], extraArgs: [], complex: null, output: 'mp4', desc: [summary] }
       const render = await enqueueRender(job, id, srcName, frag, { summary, ops: frag.desc }, meta, userMsg)
       const { rid } = render

@@ -16,6 +16,8 @@ const path = require('path')
 const fs = require('fs')
 // tool catalog (timeline.js-based editing tools the LLM can emit as ops)
 const { getTool, catalogHint } = require('./tools')
+// language-aware font selection for ASS burn-in (Thai coverage etc.)
+const fonts = require('./fonts')
 
 function even(n) {
   n = Math.round(n)
@@ -413,6 +415,17 @@ function makeTextOverlay(ops, meta, dir, duration) {
     const name = `overlay-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}-${++i}.ass`
     const end = (pos === 'center') ? 36000 : (duration || 36000) // top/bottom: as long as possible pairs with trim
     const primaryColour = assColor(op.color || 'white')
+    // font picked from the ACTUAL text: DejaVu Sans has no Thai glyphs and
+    // would render U+0E00–U+0E7F as tofu boxes
+    let sel
+    try {
+      sel = fonts.selectFont(op.text)
+    } catch (e) {
+      // no Thai-capable font installed: refuse to burn tofu, degrade the op
+      console.error('[ai] text overlay font unavailable:', e.message)
+      op.kind = null
+      continue
+    }
     const ass = `[Script Info]
 ScriptType: v4.00+
 PlayResX: ${w}
@@ -421,15 +434,15 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
-Style: A,DejaVu Sans,${Math.round(size)},${primaryColour},&H00101010,&H64000000,1,3,1,${align[pos]},${Math.round(w * 0.06)},${Math.round(w * 0.06)},${Math.round(h * 0.07)},1,1
+Style: A,${sel.family},${Math.round(size)},${primaryColour},&H00101010,&H64000000,1,3,1,${align[pos]},${Math.round(w * 0.06)},${Math.round(w * 0.06)},${Math.round(h * 0.07)},1,1
 
 [Events]
 Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:00.00,${assTimestamp(end)},A,0,0,0,,${String(op.text).replace(/\n/g, '\\N')}
 `
     try {
-      fs.writeFileSync(path.join(dir, name), ass)
-      op.vf = `subtitles='${path.join(path.resolve(dir), name).replace(/\\/g, '/')}'`
+      fs.writeFileSync(path.join(dir, name), ass, 'utf8')
+      op.vf = fonts.subtitlesFilter(path.join(path.resolve(dir), name).replace(/\\/g, '/'))
     } catch (e) {
       console.error('[ai] ass overlay failed:', e.message)
       op.kind = null
@@ -450,6 +463,10 @@ function makeCaptionAss(cues, meta, dir) {
   const name = `captions-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}.ass`
   const size = Math.round(Math.min(Math.max(h * 0.055, 20), h * 0.12, 64))
   const margin = Math.round(h * 0.07)
+  // font covers EVERY cue (union of all texts): one Thai cue anywhere in the
+  // caption track switches the whole style to a Thai-capable family — mixing
+  // families between cues would visually jump line metrics cue by cue
+  const sel = fonts.selectFont(cues.map((c) => c.text))
   const events = cues.map((c) =>
     `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},A,0,0,${Math.round(h * 0.06)},,${String(c.text).replace(/\n/g, '\\N')}`
   ).join('\n')
@@ -461,14 +478,14 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
-Style: A,DejaVu Sans,${size},&H00FFFFFF,&H00101010,&H64000000,1,3,1,2,${Math.round(w * 0.05)},${Math.round(w * 0.05)},${margin},1,1
+Style: A,${sel.family},${size},&H00FFFFFF,&H00101010,&H64000000,1,3,1,2,${Math.round(w * 0.05)},${Math.round(w * 0.05)},${margin},1,1
 
 [Events]
 Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
 ${events}
 `
-  fs.writeFileSync(path.join(dir, name), ass)
-  return `subtitles='${path.join(path.resolve(dir), name).replace(/\\/g, '/')}'`
+  fs.writeFileSync(path.join(dir, name), ass, 'utf8')
+  return fonts.subtitlesFilter(path.join(path.resolve(dir), name).replace(/\\/g, '/'))
 }
 
 // ---------------------------------------------------------------------------

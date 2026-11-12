@@ -10,6 +10,30 @@ const path = require('path')
 const ROOT = path.join(__dirname, '..')
 const REMOTION = path.join(ROOT, 'remotion', 'index.ts')
 
+// Headless Chrome resolves fonts through fontconfig on Linux/Termux. Mirror
+// vendor/fonts into the user font dir + refresh the cache so Remotion text
+// clips (incl. Thai in Root.tsx's fontFamily fallback chain) render with the
+// bundled Noto Sans Thai even on a bare container. Idempotent, best-effort.
+function ensureVendoredFontsVisible() {
+  const vendorDir = path.join(ROOT, 'vendor', 'fonts')
+  const home = process.env.HOME
+  if (!home || !fs.existsSync(vendorDir)) return
+  const target = path.join(home, '.fonts')
+  try {
+    fs.mkdirSync(target, { recursive: true })
+    for (const f of fs.readdirSync(vendorDir)) {
+      if (!/\.tt[fc]$/i.test(f)) continue
+      const dst = path.join(target, f)
+      if (!fs.existsSync(dst)) fs.copyFileSync(path.join(vendorDir, f), dst)
+    }
+    cp.execFileSync('fc-cache', ['-f', target], { timeout: 30000, stdio: 'ignore' })
+  } catch (e) {
+    console.warn('[remotion-render] font sync skipped:', e.message)
+  }
+}
+
+ensureVendoredFontsVisible()
+
 const args = process.argv.slice(2)
 if (args.includes('--studio')) {
   const propsFile = args[0]
