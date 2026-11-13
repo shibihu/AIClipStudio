@@ -7,6 +7,9 @@
   --muted: #8b97ad;
   --accent: #6c8cff;
   --accent2: #9f7cff;
+  /* solid fills: white text on these keeps WCAG AA (>=4.5:1) */
+  --accent-solid: #3d5fe8;
+  --accent-solid2: #7a4fe0;
   --ok: #38d39f;
 }
 
@@ -59,6 +62,7 @@ main {
   min-height: 0;
 }
 .drop {
+  width: 100%; font: inherit; color: inherit;
   border: 2px dashed #33405c;
   border-radius: 14px;
   min-height: 320px;
@@ -68,7 +72,11 @@ main {
   background: repeating-linear-gradient(45deg, transparent 0 14px, rgba(255,255,255,0.012) 14px 28px);
 }
 .drop.over { border-color: var(--accent); background: rgba(108,140,255,0.08); color: var(--text); }
-.drop b { font-size: 17px; color: var(--text); margin-bottom: 4px; }
+.drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-color: var(--accent); }
+.dropicon { font-size: 40px; line-height: 1; margin-bottom: 10px; }
+.drop b { font-size: 18px; color: var(--text); margin-bottom: 6px; }
+.dropsub { font-size: 13.5px; }
+.dropnote { font-size: 12px; color: #6f7c93; margin-top: 12px; }
 .drop input { display: none; }
 
 #playerWrap { display: flex; flex-direction: column; gap: 12px; }
@@ -91,7 +99,7 @@ main {
   cursor: pointer; text-decoration: none; display: inline-block;
 }
 .btn:hover { border-color: #3b4a68; }
-.btn.solid { background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; font-weight: 600; }
+.btn.solid { background: linear-gradient(135deg, var(--accent-solid), var(--accent-solid2)); border: none; font-weight: 600; color: #fff; }
 .btn.ghost { color: var(--muted); }
 .btn.danger:hover { border-color: #8a3a48; color: #e2849a; }
 .hidden { display: none !important; }
@@ -194,6 +202,10 @@ main {
 .msg .copybtn:hover { opacity: 1; color: #fff; border-color: #4b6cf5; }
 .msg.error { border-color: #6b2d3a; }
 
+.chipshint {
+  padding: 10px 14px 0; font-size: 12px; color: var(--muted);
+}
+.chipshint.hidden { display: none; }
 .chips {
   display: flex; flex-wrap: wrap; gap: 7px;
   padding: 10px 14px; border-top: 1px solid var(--line);
@@ -203,7 +215,8 @@ main {
   border: 1px solid var(--line); border-radius: 999px;
   font-size: 12.5px; padding: 6px 12px; cursor: pointer;
 }
-.chips button:hover { border-color: var(--accent); }
+.chips button:hover:not(:disabled) { border-color: var(--accent); }
+.chips button:disabled { opacity: 0.4; cursor: not-allowed; border-style: dashed; }
 
 #chatForm {
   display: flex; gap: 10px; padding: 12px 14px; border-top: 1px solid var(--line);
@@ -215,7 +228,7 @@ main {
 }
 #chatInput:focus { border-color: var(--accent); }
 #sendBtn {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: linear-gradient(135deg, var(--accent-solid), var(--accent-solid2));
   border: none; color: white; font-weight: 600;
   border-radius: 12px; padding: 0 18px; cursor: pointer; font-size: 14px;
 }

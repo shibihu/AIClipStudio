@@ -64,7 +64,12 @@
   <main>
     <!-- LEFT: the video stage -->
     <section id="stage">
-      <div id="drop" class="drop empty"></div>
+      <button type="button" id="drop" class="drop empty">
+        <span class="dropicon" aria-hidden="true">🎬</span>
+        <b>Drop a clip here</b>
+        <span class="dropsub">or browse files — MP4, MOV, WEBM, MP3, WAV</span>
+        <span class="dropnote">Processed on this server · stays private · auto-deleted after 24 h</span>
+      </button>
 
       <div id="playerWrap" class="hidden">
         <video id="video" controls playsinline></video>
@@ -113,19 +118,20 @@
         </div>
       </div>
 
-      <div id="chips" class="chips">
-        <button data-q="remove the first 2 seconds">✂️ cut first 2s</button>
-        <button data-q="make it a 9:16 vertical canvas for tiktok with a blurred background">📱 TikTok ready</button>
-        <button data-q="2x speed">⏩ 2× speed</button>
-        <button data-q="mute the audio">🔇 mute</button>
-        <button id="capChip">🗣 captions from script</button>
-        <button data-q="add text 'Good Vibes Only' at the top, big font">💬 text overlay</button>
-        <button data-q="make it a gif at 15 fps">🎞 gif</button>
-        <button data-q="black and white, more contrast">🎨 b&w</button>
-        <button data-q="boomerang">↔ boomerang</button>
-        <button data-q="what edits would you suggest for this clip?">🧠 suggest edits</button>
+      <div id="chipsHint" class="chipshint">Upload a clip to unlock the quick edits.</div>
+      <div id="chips" class="chips" aria-describedby="chipsHint">
+        <button data-q="remove the first 2 seconds" data-needs-media>✂️ cut first 2s</button>
+        <button data-q="make it a 9:16 vertical canvas for tiktok with a blurred background" data-needs-media>📱 TikTok ready</button>
+        <button data-q="2x speed" data-needs-media>⏩ 2× speed</button>
+        <button data-q="mute the audio" data-needs-media>🔇 mute</button>
+        <button id="capChip" data-needs-media>🗣 captions from script</button>
+        <button data-q="add text 'Good Vibes Only' at the top, big font" data-needs-media>💬 text overlay</button>
+        <button data-q="make it a gif at 15 fps" data-needs-media>🎞 gif</button>
+        <button data-q="black and white, more contrast" data-needs-media>🎨 b&w</button>
+        <button data-q="boomerang" data-needs-media>↔ boomerang</button>
+        <button data-q="what edits would you suggest for this clip?" data-needs-media>🧠 suggest edits</button>
         <button data-q="what can you do?">✨ all abilities</button>
-        <button data-q="louder by 2x and brighter">🔊 audio+light</button>
+        <button data-q="louder by 2x and brighter" data-needs-media>🔊 audio+light</button>
       </div>
 
       <form id="chatForm">

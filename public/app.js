@@ -98,7 +98,7 @@ drop.addEventListener('drop', (e) => {
   const f = e.dataTransfer.files[0]
   if (f) upload(f)
 })
-drop.addEventListener('click', () => drop.querySelector('input')?.click() ?? dropInput().click())
+drop.addEventListener('click', () => dropInput().click())
 
 let fileInput = null
 function dropInput() {
@@ -106,8 +106,9 @@ function dropInput() {
   fileInput = document.createElement('input')
   fileInput.type = 'file'
   fileInput.accept = 'video/*,audio/*'
+  fileInput.hidden = true
   fileInput.addEventListener('change', () => fileInput.files[0] && upload(fileInput.files[0]))
-  drop.appendChild(fileInput)
+  document.body.appendChild(fileInput)
   return fileInput
 }
 
@@ -127,6 +128,7 @@ async function upload(file) {
     dlOriginal.hidden = false
     showMedia(j.url, j.meta, j.original)
     addMsg('ai', `Loaded <b>${esc(j.original)}</b> — ${describeMeta(j.meta)}.\nTell me what to change 👇`)
+    syncChips()
     await loadVersions()
     loadStrip(j.url.split('/').pop(), j.meta)
   } catch (e) {
@@ -163,6 +165,7 @@ function overlayInput() {
   if (overlayFileInput) return overlayFileInput
   overlayFileInput = document.createElement('input')
   overlayFileInput.type = 'file'
+  overlayFileInput.hidden = true
   overlayFileInput.accept = 'image/*,video/*'
   overlayFileInput.addEventListener('change', () => overlayFileInput.files[0] && sendOverlay(overlayFileInput.files[0]))
   document.body.appendChild(overlayFileInput)
@@ -468,7 +471,23 @@ form.addEventListener('submit', (e) => {
   send(text)
 })
 
-document.querySelectorAll('.chips button').forEach(b =>
+const chipsHint = $('chipsHint')
+const chipButtons = [...document.querySelectorAll('#chips button')]
+
+// quick edits need a clip; until then they stay visibly disabled instead of failing on click
+function syncChips() {
+  const locked = !jobId
+  chipButtons.forEach(b => {
+    if (!b.hasAttribute('data-needs-media')) return
+    b.disabled = locked
+    if (locked) b.title = 'Upload a clip first'
+    else b.removeAttribute('title')
+  })
+  chipsHint.classList.toggle('hidden', !locked)
+}
+syncChips()
+
+chipButtons.forEach(b =>
   b.addEventListener('click', () => {
     if (b.id === 'capChip') { capWrap.classList.toggle('hidden'); capText.focus(); return }
     if (!jobId) { addMsg('ai', '⬆️ Upload a clip first — drop any video file on the left.'); return }
@@ -717,6 +736,7 @@ async function restore(id) {
     const j = await r.json()
     if (j.error) { addMsg('ai', '⚠️ ' + esc(j.error), true); return }
     jobId = id
+    syncChips()
     history.replaceState(null, '', '/') // clean the ?id= out of the address bar
     versions = j.versions || []
     base = j.base ?? versions.length - 1
