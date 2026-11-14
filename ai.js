@@ -18,6 +18,8 @@ const fs = require('fs')
 const { getTool, catalogHint } = require('./tools')
 // language-aware font selection for ASS burn-in (Thai coverage etc.)
 const fonts = require('./fonts')
+// shared safe-area/Thai-aware subtitle layout used by every caption path
+const subtitleLayout = require('./subtitle-layout')
 
 function even(n) {
   n = Math.round(n)
@@ -393,13 +395,7 @@ function build(ops, meta, fontFile, overlays = []) {
 // (e.g. static ARM builds) lack drawtext but include libass.
 // ---------------------------------------------------------------------------
 
-function assTimestamp(sec) {
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = Math.floor(sec % 60)
-  const cs = Math.round((sec - Math.floor(sec)) * 100)
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`
-}
+const assTimestamp = subtitleLayout.assTimestamp
 
 function makeTextOverlay(ops, meta, dir, duration) {
   const w = meta.width || 1280
@@ -458,33 +454,24 @@ Dialogue: 0,0:00:00.00,${assTimestamp(end)},A,0,0,0,,${String(op.text).replace(/
 // ---------------------------------------------------------------------------
 
 function makeCaptionAss(cues, meta, dir) {
-  const w = meta.width || 1280
-  const h = meta.height || 720
   const name = `captions-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}.ass`
-  const size = Math.round(Math.min(Math.max(h * 0.055, 20), h * 0.12, 64))
-  const margin = Math.round(h * 0.07)
   // font covers EVERY cue (union of all texts): one Thai cue anywhere in the
   // caption track switches the whole style to a Thai-capable family — mixing
   // families between cues would visually jump line metrics cue by cue
   const sel = fonts.selectFont(cues.map((c) => c.text))
-  const events = cues.map((c) =>
-    `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},A,0,0,${Math.round(h * 0.06)},,${String(c.text).replace(/\n/g, '\\N')}`
-  ).join('\n')
-  const ass = `[Script Info]
-ScriptType: v4.00+
-PlayResX: ${w}
-PlayResY: ${h}
-WrapStyle: 2
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
-Style: A,${sel.family},${size},&H00FFFFFF,&H00101010,&H64000000,1,3,1,2,${Math.round(w * 0.05)},${Math.round(w * 0.05)},${margin},1,1
-
-[Events]
-Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
-${events}
-`
-  fs.writeFileSync(path.join(dir, name), ass, 'utf8')
+  // shared safe-area layout: frame-aware font size, Thai word wrapping,
+  // max two lines by default, vertical block guaranteed inside the frame
+  const built = subtitleLayout.buildAssTrack(cues, meta, {
+    family: sel.family,
+    styleName: 'A',
+    bold: 1,
+    outline: 3,
+    shadow: 1,
+    primaryColour: '&H00FFFFFF',
+    outlineColour: '&H00101010',
+    backColour: '&H64000000',
+  })
+  fs.writeFileSync(path.join(dir, name), built.ass, 'utf8')
   return fonts.subtitlesFilter(path.join(path.resolve(dir), name).replace(/\\/g, '/'))
 }
 
