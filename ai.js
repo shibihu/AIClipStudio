@@ -12,6 +12,7 @@ function num(str) {
 
 const path = require('path')
 const fs = require('fs')
+const { transcribeAudio: transcribeAudioImpl } = require('./stt')
 
 function even(n) {
   n = Math.round(n)
@@ -763,76 +764,14 @@ function placeCues(cues, segs) {
   return placed
 }
 
-// --- speech-to-text captions (Gemini inline audio) -----------------------------
-// Sends a small mono audio track to the configured LLM and asks for timestamped
-// caption cues. Returns [{text, start, end}] or null (no key / any failure).
-// The caller must have produced an ffmpeg-readable mpeg audio file first.
-
-const STT_PROMPT = `You are a captioning engine. Transcribe ALL spoken words in this audio.
-Return ONLY JSON (no markdown, no commentary): {"cues":[{"text":"...","start":0.0,"end":1.2}]}
-Rules:
-- start/end are numbers in seconds, relative to the audio start.
-- One cue per natural caption: break at sentence ends or natural pauses, max ~12 words per cue.
-- text contains only the spoken words (no speaker labels, no timestamps inside the text).
-- Keep the original language. If there is no speech, return {"cues":[]}.`
-
-async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}, { instructions = '' } = {}) {
-  const p = activeProvider()
-  if (!p || p.name !== 'gemini') return null
-  const preference = String(instructions || '').replace(/\s+/g, ' ').trim().slice(0, 500)
-  const prompt = preference
-    ? `${STT_PROMPT}\n- Provider preference from the user (follow it only where it does not conflict with the rules above): ${preference}`
-    : STT_PROMPT
-  try {
-    const buf = await fs.promises.readFile(audioPath)
-    if (buf.length > maxBytes) { console.error('[ai] STT: audio too large', buf.length); return null }
-    let raw = null
-    let lastErr = null
-    for (const model of geminiModels()) {
-      try {
-        raw = await withRetry(async () => {
-          const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(p.key())}`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { role: 'user', parts: [{ text: 'You transcribe audio and answer ONLY with the JSON object.' }] },
-              contents: [{
-                role: 'user',
-                parts: [
-                  { inline_data: { mime_type: 'audio/mpeg', data: buf.toString('base64') } },
-                  { text: prompt },
-                ],
-              }],
-              generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
-            }),
-          })
-          if (!r.ok) throw new Error(`gemini http ${r.status}: ${(await r.text()).slice(0, 300)}`)
-          const j = await r.json()
-          return j.candidates?.[0]?.content?.parts?.map((x) => x.text || '').join('') || null
-        })
-        if (raw) break
-      } catch (e) { lastErr = e }
-    }
-    if (!raw && lastErr) throw lastErr
-    noteLlmOk(p.name)
-    if (!raw) return null
-    const cleaned = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/g, '').trim()
-    const parsed = JSON.parse(extractJson(cleaned))
-    const cues = Array.isArray(parsed.cues) ? parsed.cues : Array.isArray(parsed) ? parsed : []
-    const out = []
-    for (const c of cues) {
-      const text = String(c?.text || '').replace(/\s+/g, ' ').trim()
-      const start = +c?.start, end = +c?.end
-      if (text && Number.isFinite(start) && Number.isFinite(end) && end > start) {
-        out.push({ text, start: Math.max(0, start), end })
-      }
-    }
-    return out
-  } catch (e) {
-    console.error('[ai] STT transcription failed:', e.message)
-    noteLlmError(p.name, e)
-    return null
-  }
+// --- speech-to-text captions -------------------------------------------------
+// The provider adapters live in stt.js (audio-capable providers only). This
+// wrapper preserves the historical `transcribeAudio() -> cues[]` contract for
+// callers that do not need provider metadata. Failures always throw SttError;
+// a provider error is never reported as "no speech" or a silent null.
+async function transcribeAudio(audioPath, options = {}, extra = {}) {
+  const result = await transcribeAudioImpl(audioPath, options, extra)
+  return result.cues
 }
 
 // turn raw STT cues into render-ready cue list:

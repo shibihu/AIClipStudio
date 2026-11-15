@@ -38,8 +38,11 @@ const { execFile, spawn } = require('child_process')
 const { resolveBinaries } = require('./ffmpeg')
 const {
   understand, understandWithLLM, build, makeTextOverlay, writeCaptionAss,
-  buildCues, placeCues, transcribeAudio, normalizeTranscriptCues, getLlmHealth,
+  buildCues, placeCues, normalizeTranscriptCues, getLlmHealth,
 } = require('./ai')
+const {
+  transcribeAudio, SttError, listSttProviders,
+} = require('./stt')
 const {
   POSITIONS, DEFAULT_POSITION, SUBTITLE_MODES,
   normalizePosition, normalizeMode, normalizeStyle, positionLabel,
@@ -60,6 +63,38 @@ const PUBLIC = path.join(ROOT, 'public')
 const JOBS = path.join(ROOT, 'jobs')
 const MAX_UPLOAD = 1024 * 1024 * 1024 // 1 GB
 const RENDER_CONCURRENCY = 1 // serialize renders: one ffmpeg at a time
+const MAX_RENDER_QUEUE = Math.max(1, Math.min(64, Number(process.env.MAX_RENDER_QUEUE) || 8))
+const BACKEND_VERSION = '1.1.0'
+const API_SCHEMA_VERSION = 2
+const UPLOAD_AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'aiff', 'aif', 'mpga'])
+const UPLOAD_VIDEO_EXT = new Set(['mp4', 'mov', 'webm', 'mkv', 'm4v', 'avi', 'gif'])
+
+const CAPABILITIES = Object.freeze({
+  androidSkills: true,
+  captionInstructions: true,
+  subtitlePositioning: true,
+  subtitlePositions: POSITIONS,
+  subtitleModes: SUBTITLE_MODES,
+  subtitleStyle: true,
+  burnedInSubtitleDetection: true,
+  sceneDetection: true,
+  renderValidation: true,
+  structuredSttErrors: true,
+  apiSchemaVersion: API_SCHEMA_VERSION,
+  stt: null, // filled from stt.js (keys can change between requests in dev)
+})
+
+function backendInfo() {
+  return {
+    name: 'ai-clip-studio',
+    version: BACKEND_VERSION,
+    apiSchemaVersion: API_SCHEMA_VERSION,
+  }
+}
+
+function currentCapabilities() {
+  return { ...CAPABILITIES, stt: listSttProviders() }
+}
 
 fs.mkdirSync(JOBS, { recursive: true })
 
@@ -248,6 +283,29 @@ function extOf(filename, mime) {
 
 function fmtMB(n) { return n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB' }
 
+function validJobId(id) {
+  return typeof id === 'string' && /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)
+}
+
+function uploadKind(ext) {
+  if (UPLOAD_VIDEO_EXT.has(ext)) return 'video'
+  if (UPLOAD_AUDIO_EXT.has(ext)) return 'audio'
+  return null
+}
+
+function sttErrorPayload(error) {
+  const stt = error instanceof SttError
+    ? error
+    : new SttError('STT_PROVIDER_UNREACHABLE', 'The speech service is unreachable right now.')
+  return {
+    error: stt.toJSON(),
+    // Legacy clients read `reply`/`error` as a string; keep a human message
+    // alongside the structured object without hiding the code from new clients.
+    reply: stt.message,
+    retryable: stt.retryable,
+  }
+}
+
 function ffprobeJson(file) {
   return new Promise((resolve) => {
     execFile(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file], { timeout: 30000 }, (err, stdout) => {
@@ -259,7 +317,13 @@ function ffprobeJson(file) {
 
 async function probe(file) {
   const j = await ffprobeJson(file)
-  if (!j) return { duration: null, width: null, height: null, hasVideo: true, hasAudio: true, fps: 30 }
+  if (!j) {
+    return {
+      duration: null, width: null, height: null,
+      hasVideo: false, hasAudio: false, fps: null,
+      format: 'unknown', probeFailed: true,
+    }
+  }
   const v = (j.streams || []).find((s) => s.codec_type === 'video')
   const a = (j.streams || []).find((s) => s.codec_type === 'audio')
   const meta = {
@@ -272,6 +336,7 @@ async function probe(file) {
     hasAudio: !!a,
     fps: v && v.avg_frame_rate && v.avg_frame_rate.includes('/') ? Math.round((v.avg_frame_rate.split('/').reduce((a2, b) => a2 / b)) * 100) / 100 : 30,
     format: j.format?.format_name || 'unknown',
+    probeFailed: false,
   }
   return meta
 }
@@ -368,6 +433,12 @@ let activeRuns = 0
 // A pending.json marker survives server restarts: rehydrateRenders() re-queues
 // the interrupted render on boot (or reports it as failed if the source is gone).
 async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
+  if (renderQueue.length + activeRuns >= MAX_RENDER_QUEUE) {
+    const error = new Error('The render queue is full. Wait for an edit to finish and try again.')
+    error.code = 'RENDER_QUEUE_FULL'
+    error.status = 429
+    throw error
+  }
   const src = path.join(JOBS, jobId, srcName)
   const outName = `out-${job.next++}.${frag.output}`
   const outPath = path.join(JOBS, jobId, outName)
@@ -397,6 +468,8 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
     userMsg,
     fromIndex: job.base,
     expected, proc: null, media: null, thumb: null, reply: null,
+    // source facts for output validation (audio must survive a caption burn)
+    sourceMeta: meta ? { hasAudio: !!meta.hasAudio, hasVideo: !!meta.hasVideo } : null,
     // structured, user-safe facts (captions/position/audio/detection) — the
     // raw args stay server-side and only surface in explicit debug mode
     facts: frag.facts || {},
@@ -447,7 +520,14 @@ async function startRender(reg) {
       return resolve()
     }
     reg.proc = proc
-    const watchdog = setTimeout(resolve, 15 * 60 * 1000) // hard stop at 15 min
+    const watchdog = setTimeout(() => {
+      // A watchdog that only resolves leaves an orphan FFmpeg writing the
+      // output while the queue advances. Kill the process, then settle.
+      errTail = 'render timed out after 15 minutes'
+      reg.timedOut = true
+      try { proc.kill('SIGKILL') } catch { /* already gone */ }
+      resolve()
+    }, 15 * 60 * 1000)
     proc.on('error', (e) => { errTail = e.message; clearTimeout(watchdog); resolve() })
     proc.stdout.on('data', (d) => {
       if (!reg.expected) return
@@ -474,7 +554,23 @@ async function startRender(reg) {
   reg.finishedAt = Date.now()
   reg.errTail = errTail
   if (code === 0) {
-    const outMeta = await probe(reg.outPath)
+    const outputKind = /\.mp3$/i.test(reg.outName) ? 'audio' : 'video'
+    const validation = await validateRenderOutput(reg.outPath, {
+      kind: outputKind,
+      expectAudio: reg.sourceMeta?.hasAudio === true && outputKind === 'video' && !reg.args.includes('-an'),
+      duration: reg.expected,
+    })
+    if (!validation.ok) {
+      code = 1
+      errTail = `output validation failed: ${validation.reason}`
+      console.error(`[ai-studio] render ${reg.jobId}/${reg.outName} ${errTail}`)
+    } else {
+      reg.validation = { ok: true, duration: validation.meta.duration }
+    }
+    const outMeta = validation.ok ? validation.meta : null
+    if (!outMeta) {
+      // skip the success branch below; failure cleanup is shared
+    } else {
     const thumbName = `thumb-${reg.outName}.jpg`
     const thumbOk = await makeThumb(path.join(JOBS, reg.jobId), reg.outPath, thumbName)
     reg.media = { url: `/media/${reg.jobId}/${encodeURIComponent(reg.outName)}`, ...outMeta, name: reg.outName }
@@ -512,6 +608,7 @@ async function startRender(reg) {
       await saveJob(job, reg.jobId)
       console.log(`[ai-studio] render ${reg.jobId}/${reg.outName} done → v${vN}`)
     }
+    }
   } else {
     await fsp.rm(reg.outPath, { force: true }).catch(() => {})
     fail(reg, errTail)
@@ -544,6 +641,7 @@ async function rehydrateRenders() {
     // can the source be re-rendered at all?
     const sourceOk = await fsp.stat(path.join(JOBS, id, pend.srcName)).then(() => true, () => false)
     if (sourceOk) {
+      const sourceMeta = await probe(path.join(JOBS, id, pend.srcName))
       renders.set(pend.rid, {
         rid: pend.rid, jobId: id, status: 'queued', progress: 0,
         srcName: pend.srcName, args: pend.args, cmdDisplay: pend.cmdDisplay,
@@ -551,6 +649,7 @@ async function rehydrateRenders() {
         summary: pend.summary || '', ops: pend.ops || [],
         userMsg: pend.userMsg, fromIndex: pend.fromIndex ?? null,
         expected: pend.expected || 0, proc: null, media: null, thumb: null, reply: null,
+        sourceMeta: { hasAudio: !!sourceMeta.hasAudio, hasVideo: !!sourceMeta.hasVideo },
         facts: pend.facts || {}, errTail: '',
       })
       // the marker stays until this requeued render finishes (startRender removes it)
@@ -608,6 +707,59 @@ function speechSegments(src, meta) {
         resolve(ok)
       })
   })
+}
+
+// --- scene detection (FFmpeg scene score) ------------------------------------
+// Returns timeline positions in seconds. This is the route the Android
+// "Scene detection" skill has always called; it used to be a 404.
+function detectSceneCuts(src, { threshold = 0.35 } = {}) {
+  const t = Math.min(0.95, Math.max(0.05, Number(threshold) || 0.35))
+  return new Promise((resolve, reject) => {
+    execFile(
+      FFMPEG,
+      ['-hide_banner', '-i', src, '-an', '-vf', `select='gt(scene,${t})',showinfo`, '-f', 'null', '-'],
+      { timeout: 180000, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        // select+showinfo exits 0; a decode failure is a real error.
+        if (err) return reject(new Error('scene detection failed'))
+        const times = []
+        for (const m of String(stderr || '').matchAll(/pts_time:\s*([\d.]+)/g)) {
+          const time = Math.round(parseFloat(m[1]) * 1000) / 1000
+          if (Number.isFinite(time) && time >= 0) times.push(time)
+        }
+        resolve({ scenes: [...new Set(times)].sort((a, b) => a - b), threshold: t })
+      },
+    )
+  })
+}
+
+// --- render output validation ------------------------------------------------
+// Never report success just because FFmpeg exited 0. Keep the checks cheap and
+// independent from the render fragment: file, streams, duration, dimensions.
+async function validateRenderOutput(outPath, expected = {}) {
+  let st
+  try { st = await fsp.stat(outPath) } catch {
+    return { ok: false, reason: 'output file missing' }
+  }
+  if (!st.isFile() || st.size <= 0) return { ok: false, reason: 'output file is empty' }
+  const meta = await probe(outPath)
+  if (meta.probeFailed) return { ok: false, reason: 'output is not decodable' }
+  if (expected.kind !== 'audio' && !meta.hasVideo) return { ok: false, reason: 'output has no video stream' }
+  if (expected.expectAudio && !meta.hasAudio) return { ok: false, reason: 'output lost the expected audio stream' }
+  if (!meta.duration || meta.duration < 0.05) return { ok: false, reason: 'output duration is invalid' }
+  if (expected.duration != null && expected.duration > 0) {
+    const tolerance = Math.max(0.75, expected.duration * 0.08)
+    if (Math.abs(meta.duration - expected.duration) > tolerance) {
+      return {
+        ok: false,
+        reason: `output duration ${meta.duration}s differs from expected ${expected.duration}s`,
+      }
+    }
+  }
+  if (meta.hasVideo && (!meta.width || !meta.height)) {
+    return { ok: false, reason: 'output has no frame dimensions' }
+  }
+  return { ok: true, meta }
 }
 
 // --- periodic cleanup: remove job dirs older than JOBS_TTL_HOURS (default 24) --
@@ -781,22 +933,37 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/health') {
       return json(res, 200, {
-        ok: true, ffmpeg: FFMPEG, ffmpegOk: FFMPEG_OK,
+        ok: true,
+        backend: backendInfo(),
+        ffmpeg: FFMPEG,
+        ffmpegOk: FFMPEG_OK,
         aiKey: !!(process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY),
         llm: getLlmHealth(),
         auth: !!AUTH_TOKEN,
-        renders: { active: activeRuns, queued: renderQueue.length, concurrency: RENDER_CONCURRENCY },
+        renders: {
+          active: activeRuns,
+          queued: renderQueue.length,
+          concurrency: RENDER_CONCURRENCY,
+          maxQueue: MAX_RENDER_QUEUE,
+        },
         // Capability flags let the Android client fail loudly instead of
         // silently dropping a setting this deployment does not support.
         capabilities: {
-          androidSkills: true,
-          captionInstructions: true,
-          subtitlePositioning: true,
-          subtitlePositions: POSITIONS,
-          subtitleModes: SUBTITLE_MODES,
-          subtitleStyle: true,
-          burnedInSubtitleDetection: true,
+          ...currentCapabilities(),
           renderDebugMode: DEBUG_ENABLED(),
+        },
+      })
+    }
+
+    // ---- machine-readable version + capabilities (Android compatibility) ----
+    if (p === '/api/version' && req.method === 'GET') {
+      return json(res, 200, {
+        ...backendInfo(),
+        capabilities: currentCapabilities(),
+        limits: {
+          maxUploadBytes: MAX_UPLOAD,
+          maxRenderQueue: MAX_RENDER_QUEUE,
+          renderConcurrency: RENDER_CONCURRENCY,
         },
       })
     }
@@ -861,11 +1028,34 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: 'no file received' })
       }
       const ext = extOf(file.filename, file.mime)
+      const kind = uploadKind(ext)
+      if (!kind) {
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
+        return json(res, 415, {
+          error: {
+            code: 'UPLOAD_TYPE_UNSUPPORTED',
+            message: `Unsupported file type ".${ext}". Upload a video or audio file.`,
+            retryable: false,
+          },
+        })
+      }
       const fname = `input.${ext}`
       await fsp.rename(tmp, path.join(dir, fname))
       const meta = await probe(path.join(dir, fname))
+      // A probe failure used to return optimistic defaults, which created jobs
+      // that failed later inside FFmpeg. Reject unreadable media up front.
+      if (meta.probeFailed || (kind === 'video' && !meta.hasVideo) || (kind === 'audio' && !meta.hasAudio)) {
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => {})
+        return json(res, 422, {
+          error: {
+            code: 'UPLOAD_MEDIA_INVALID',
+            message: 'The uploaded file is not a readable video or audio file.',
+            retryable: false,
+          },
+        })
+      }
       // thumbnail for the first version (cheap, helps the version strip right away)
-      const thumbOk = await makeThumb(dir, path.join(dir, fname), `thumb-${fname}.jpg`)
+      const thumbOk = kind === 'video' ? await makeThumb(dir, path.join(dir, fname), `thumb-${fname}.jpg`) : false
       const job = {
         msgs: [],
         input: fname,
@@ -888,8 +1078,12 @@ const server = http.createServer(async (req, res) => {
     // ---- chat / edit ----
     if (p === '/api/chat' && req.method === 'POST') {
       const { id, message } = await readJson(req)
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
       const job = getJob(id)
-      if (!job) return json(res, 404, { error: 'unknown job — upload a clip first' })
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'unknown job — upload a clip first', retryable: false } })
+      if (typeof message !== 'string' || !message.trim()) {
+        return json(res, 400, { error: { code: 'BAD_REQUEST', message: 'A non-empty message is required.', retryable: false } })
+      }
       const srcName = job.versions[job.base].name
       const src = path.join(JOBS, id, srcName)
       const meta = await probe(src)
@@ -988,8 +1182,11 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/render' && req.method === 'GET') {
       const id = url.searchParams.get('id') || ''
       const rid = url.searchParams.get('rid') || ''
+      if (!validJobId(id) || !validJobId(rid)) {
+        return json(res, 400, { error: { code: 'BAD_REQUEST', message: 'Invalid render or job id.', retryable: false } })
+      }
       const reg = renders.get(rid)
-      if (!reg || reg.jobId !== id) return json(res, 404, { error: 'render not found (server restarted?) — send the edit again' })
+      if (!reg || reg.jobId !== id) return json(res, 404, { error: { code: 'RENDER_NOT_FOUND', message: 'Render not found (server restarted?) — send the edit again', retryable: true } })
       if (reg.status === 'queued') return json(res, 200, { status: 'queued', progress: 0, queuedAhead: Math.max(0, renderQueue.indexOf(rid)) })
       if (reg.status === 'running') return json(res, 200, { status: 'running', progress: reg.progress })
       const facts = renderFacts(reg)
@@ -1019,16 +1216,18 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/job' && req.method === 'GET') {
       const id = url.searchParams.get('id') || ''
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
       const job = getJob(id)
-      if (!job) return json(res, 404, { error: 'unknown job' })
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'unknown job', retryable: false } })
       return json(res, 200, { versions: job.versions, base: job.base, msgs: job.msgs })
     }
 
     // pin a version as the edit base (rollback = point base at the past)
     if (p === '/api/version' && req.method === 'POST') {
       const { id, index } = await readJson(req)
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
       const job = getJob(id)
-      if (!job) return json(res, 404, { error: 'unknown job' })
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'unknown job', retryable: false } })
       const i = parseInt(index, 10)
       if (!Number.isInteger(i) || i < 0 || i >= job.versions.length) return json(res, 400, { error: 'bad version index' })
       job.base = i
@@ -1040,7 +1239,7 @@ const server = http.createServer(async (req, res) => {
     // delete a job and all its media
     if (p === '/api/job' && req.method === 'DELETE') {
       const id = url.searchParams.get('id') || ''
-      if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)) return json(res, 400, { error: 'bad job id' })
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
       history.delete(id)
       // fail any pending renders for this job
       for (const reg of renders.values()) {
@@ -1057,8 +1256,9 @@ const server = http.createServer(async (req, res) => {
     // ---- filmstrip (powers the visual trim picker) ----
     if (p === '/api/strip' && req.method === 'GET') {
       const id = url.searchParams.get('id') || ''
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
       const job = getJob(id)
-      if (!job) return json(res, 404, { error: 'unknown job' })
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'unknown job', retryable: false } })
       const vName = url.searchParams.get('v') && job.versions.some((v) => v.name === url.searchParams.get('v'))
         ? url.searchParams.get('v') : job.versions[job.base].name
       const src = path.join(JOBS, id, vName)
@@ -1080,6 +1280,43 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { url: `/media/${id}/${encodeURIComponent(cacheName)}`, duration: dur, version: vName })
     }
 
+    // ---- tool dispatch (Android Skills) ------------------------------------
+    if (p === '/api/tool' && req.method === 'POST') {
+      const body = await readJson(req)
+      const { id, tool } = body
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
+      if (tool !== 'detect_scenes') {
+        return json(res, 400, {
+          error: { code: 'TOOL_UNSUPPORTED', message: `Tool "${String(tool || '')}" is not supported.`, retryable: false },
+        })
+      }
+      const job = getJob(id)
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'Unknown job.', retryable: false } })
+      const srcName = job.versions[job.base].name
+      const src = path.join(JOBS, id, srcName)
+      const meta = await probe(src)
+      if (!meta.hasVideo || meta.probeFailed) {
+        return json(res, 422, {
+          error: { code: 'TOOL_MEDIA_INVALID', message: 'Scene detection needs a readable video version.', retryable: false },
+        })
+      }
+      try {
+        const detected = await detectSceneCuts(src, body.args || {})
+        return json(res, 200, {
+          result: {
+            scenes: detected.scenes.map((time) => ({ time })),
+            threshold: detected.threshold,
+            count: detected.scenes.length,
+          },
+        })
+      } catch (e) {
+        console.error('[ai-studio] scene detection failed:', e.message)
+        return json(res, 500, {
+          error: { code: 'TOOL_FAILED', message: 'Scene detection failed for this clip.', retryable: true },
+        })
+      }
+    }
+
     // ---- captions: paste script → silence-timed burn-in, or auto-transcribe ----
     // Request fields (all optional, existing shape still works):
     //   position   one of POSITIONS (top_center … bottom_right)
@@ -1090,8 +1327,9 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/captions' && req.method === 'POST') {
       const body = await readJson(req)
       const { id, text, auto, instructions, layer } = body
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
       const job = getJob(id)
-      if (!job) return json(res, 404, { error: 'unknown job — upload a clip first' })
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'unknown job — upload a clip first', retryable: false } })
       const srcName = job.versions[job.base].name
       const src = path.join(JOBS, id, srcName)
       const meta = await probe(src)
@@ -1136,19 +1374,38 @@ const server = http.createServer(async (req, res) => {
         try { fs.accessSync(audioPath) } catch { have = false }
         if (!have) {
           const r = await run(FFMPEG, ['-y', '-hide_banner', '-i', src, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', '-map', 'a:0', audioPath], 300000)
-          if (!r.ok) return json(res, 500, { error: 'audio extraction failed' })
+          if (!r.ok) {
+            return json(res, 500, {
+              error: { code: 'STT_AUDIO_EXTRACTION_FAILED', message: 'Could not extract the audio track for transcription.', retryable: true },
+            })
+          }
         }
-        const raw = await transcribeAudio(audioPath, meta, { instructions })
-        placed = raw && raw.length
-          ? normalizeTranscriptCues(raw, meta, { maxChars: layout.maxChars, maxLines: layout.maxLines })
-          : null
-        if (!placed || !placed.length) {
-          console.log(`[ai-studio] auto-captions ${id}: STT returned ${raw ? raw.length : 'no'} cue(s) — falling back to manual script`)
-          const reply = "I couldn't auto-transcribe this clip (the speech service isn't reachable, or there's no clear speech). You can paste your script instead — ✨ pasted captions are timed with silence detection and need no cloud."
-          job.msgs.push({ role: 'user', content: 'auto-transcribe captions' }, { role: 'assistant', content: reply })
+        let stt
+        try {
+          stt = await transcribeAudio(audioPath, { maxBytes: 20 * 1024 * 1024 }, { instructions })
+        } catch (e) {
+          const status = e instanceof SttError ? e.status : 502
+          const payload = sttErrorPayload(e)
+          console.log(`[ai-studio] auto-captions ${id}: ${payload.error.code} (${payload.error.provider || 'no provider'})`)
+          job.msgs.push({ role: 'user', content: 'auto-transcribe captions' }, { role: 'assistant', content: payload.reply })
           await saveJob(job, id)
-          return json(res, 200, { reply, commands: [], media: null })
+          return json(res, status, payload)
         }
+        placed = normalizeTranscriptCues(stt.cues, meta, {
+          maxChars: layout.maxChars,
+          maxLines: layout.maxLines,
+        })
+        if (!placed.length) {
+          const empty = new SttError('STT_EMPTY_TRANSCRIPT',
+            'The speech provider returned no usable caption cues for this clip.',
+            { provider: stt.provider, model: stt.model })
+          const payload = sttErrorPayload(empty)
+          console.log(`[ai-studio] auto-captions ${id}: empty transcript from ${stt.provider}/${stt.model}`)
+          job.msgs.push({ role: 'user', content: 'auto-transcribe captions' }, { role: 'assistant', content: payload.reply })
+          await saveJob(job, id)
+          return json(res, empty.status, payload)
+        }
+        console.log(`[ai-studio] auto-captions ${id}: ${placed.length} cue(s) from ${stt.provider}/${stt.model}`)
         userMsg = '🎙 auto-transcribe and caption the spoken words'
       } else {
         // ---- pasted-script path ---------------------------------------------
@@ -1233,7 +1490,13 @@ const server = http.createServer(async (req, res) => {
     return send(res, 404, 'not found')
   } catch (e) {
     console.error(e)
-    try { json(res, 500, { error: e.message || 'internal error' }) } catch { /* headers sent */ }
+    const status = Number(e.status) >= 400 && Number(e.status) < 600 ? Number(e.status) : 500
+    const code = typeof e.code === 'string' && /^[A-Z0-9_]+$/.test(e.code) ? e.code : 'INTERNAL_ERROR'
+    // Never leak internal paths/filter text to ordinary clients.
+    const message = status < 500
+      ? String(e.message || 'The request could not be completed.')
+      : 'The server could not complete this request. Try again shortly.'
+    try { json(res, status, { error: { code, message, retryable: status >= 500 || status === 429 } }) } catch { /* headers sent */ }
   }
 })
 
