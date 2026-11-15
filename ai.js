@@ -352,33 +352,48 @@ Dialogue: 0,0:00:00.00,${assTimestamp(end)},A,0,0,0,,${String(op.text).replace(/
 // makeCaptionAss — timed multi-cue `.ass` caption burn-in. The server places
 // cues on detected speech segments (silencedetect), here we just render them.
 // Returns the `subtitles=<path>` video filter expression.
+//
+// Position/style are resolved by subtitle-layout.js so the Android UI, the API
+// and this generator can never disagree about where a caption belongs.
 // ---------------------------------------------------------------------------
 
-function makeCaptionAss(cues, meta, dir) {
-  const w = meta.width || 1280
-  const h = meta.height || 720
-  const name = `captions-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}.ass`
-  const size = Math.round(Math.min(Math.max(h * 0.055, 20), h * 0.12, 64))
-  const margin = Math.round(h * 0.07)
-  const events = cues.map((c) =>
-    `Dialogue: 0,${assTimestamp(c.start)},${assTimestamp(c.end)},A,0,0,${Math.round(h * 0.06)},,${String(c.text).replace(/\n/g, '\\N')}`
-  ).join('\n')
-  const ass = `[Script Info]
-ScriptType: v4.00+
-PlayResX: ${w}
-PlayResY: ${h}
-WrapStyle: 2
+const {
+  resolveCaptionLayout,
+  buildAssDocument,
+  wrapCueText,
+  positionLabel,
+} = require('./subtitle-layout')
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, BorderStyle, Encoding
-Style: A,DejaVu Sans,${size},&H00FFFFFF,&H00101010,&H64000000,1,3,1,2,${Math.round(w * 0.05)},${Math.round(w * 0.05)},${margin},1,1
+function assFilterForFile(file) {
+  const forward = path.resolve(file).replace(/\\/g, '/')
+  const escape = (value) => value.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'")
+  let filter = `subtitles=filename='${escape(forward)}'`
+  // FFmpeg builds that rely on fontconfig need to be told where the fonts are.
+  // Linux deployments normally have a system fontconfig. Windows builds use
+  // DirectWrite, which already knows the system fonts: pointing fontsdir at
+  // C:/Windows/Fonts makes libass scan every legacy .fon file with fontconfig,
+  // which is slow and floods stderr. Only pass a directory when the operator
+  // explicitly configures one (e.g. a container with bundled Thai fonts).
+  const fontsDir = (process.env.SUBTITLE_FONTSDIR || '').trim()
+  if (fontsDir && fontsDir !== 'none' && fontsDir !== 'off') filter += `:fontsdir='${escape(fontsDir)}'`
+  return filter
+}
 
-[Events]
-Format: Layer, Start, End, Style, MarginL, MarginR, MarginV, Effect, Text
-${events}
-`
-  fs.writeFileSync(path.join(dir, name), ass)
-  return `subtitles='${path.join(path.resolve(dir), name).replace(/\\/g, '/')}'`
+/**
+ * Write the caption .ass file and return everything the renderer/report needs.
+ * @returns {{filter:string, layout:object, file:string, body:string}}
+ */
+function writeCaptionAss(cues, meta, dir, options = {}) {
+  const layout = resolveCaptionLayout(options, meta)
+  const name = `captions-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e4)}${options.suffix ? `-${String(options.suffix).replace(/\W+/g, '')}` : ''}.ass`
+  const body = buildAssDocument(cues, meta, layout)
+  const filePath = path.join(dir, name)
+  fs.writeFileSync(filePath, body)
+  return { filter: assFilterForFile(filePath), layout, file: name, body }
+}
+
+function makeCaptionAss(cues, meta, dir, options = {}) {
+  return writeCaptionAss(cues, meta, dir, options).filter
 }
 
 // ---------------------------------------------------------------------------
@@ -718,22 +733,14 @@ function extractJson(s) {
 //   • STT transcript → transcribeAudio() → normalizeTranscriptCues(cues, meta)
 // ---------------------------------------------------------------------------
 
-function buildCues(text) {
+function buildCues(text, { maxChars = 48, maxLines = 2 } = {}) {
   const cues = []
-  const wrap = (s, max) => {
-    const words = s.split(/\s+/)
-    const out = []
-    let cur = ''
-    for (const w of words) {
-      if (cur && (cur + ' ' + w).length > max) { out.push(cur); cur = w } else cur = (cur ? cur + ' ' : '') + w
-    }
-    if (cur) out.push(cur)
-    return out
-  }
   for (let line of String(text || '').split(/\r?\n+/)) {
     line = line.trim()
     if (!line) continue
-    cues.push(...wrap(line, 48))
+    // Thai text has no spaces: wrapCueText() segments it by dictionary words
+    // and never splits a base character from its tone mark.
+    cues.push(...wrapCueText(line, { maxChars, maxLines }))
   }
   return cues.slice(0, 80)
 }
@@ -769,9 +776,13 @@ Rules:
 - text contains only the spoken words (no speaker labels, no timestamps inside the text).
 - Keep the original language. If there is no speech, return {"cues":[]}.`
 
-async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) {
+async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}, { instructions = '' } = {}) {
   const p = activeProvider()
   if (!p || p.name !== 'gemini') return null
+  const preference = String(instructions || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+  const prompt = preference
+    ? `${STT_PROMPT}\n- Provider preference from the user (follow it only where it does not conflict with the rules above): ${preference}`
+    : STT_PROMPT
   try {
     const buf = await fs.promises.readFile(audioPath)
     if (buf.length > maxBytes) { console.error('[ai] STT: audio too large', buf.length); return null }
@@ -789,7 +800,7 @@ async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) 
                 role: 'user',
                 parts: [
                   { inline_data: { mime_type: 'audio/mpeg', data: buf.toString('base64') } },
-                  { text: STT_PROMPT },
+                  { text: prompt },
                 ],
               }],
               generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
@@ -826,8 +837,9 @@ async function transcribeAudio(audioPath, { maxBytes = 20 * 1024 * 1024 } = {}) 
 
 // turn raw STT cues into render-ready cue list:
 //  • validate/clip timestamps to media duration, drop zero-length cues, sort
-//  • wrap long lines into ≤ maxChars chunks spread evenly over the cue window
-function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxCues = 120 } = {}) {
+//  • wrap long lines into ≤ maxLines chunks (Thai-aware) spread evenly over
+//    the cue window — captions are never truncated
+function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxLines = 2, maxCues = 120 } = {}) {
   const dur = typeof meta?.duration === 'number' && meta.duration > 0 ? meta.duration : null
   const valid = (Array.isArray(cues) ? cues : [])
     .map((c) => ({
@@ -841,13 +853,8 @@ function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxCues = 120 } = 
 
   const out = []
   for (const c of valid) {
-    const words = c.text.split(' ')
-    const lines = []
-    let cur = ''
-    for (const w of words) {
-      if (cur && (cur + ' ' + w).length > maxChars) { lines.push(cur); cur = w } else cur = cur ? cur + ' ' + w : w
-    }
-    if (cur) lines.push(cur)
+    const lines = wrapCueText(c.text, { maxChars, maxLines })
+    if (!lines.length) continue
     const d = (c.end - c.start) / lines.length
     lines.forEach((text, i) => {
       if (out.length < maxCues) out.push({ text, start: +((c.start + i * d)).toFixed(2), end: +((c.start + (i + 1) * d)).toFixed(2) })
@@ -858,7 +865,8 @@ function normalizeTranscriptCues(cues, meta, { maxChars = 48, maxCues = 120 } = 
 }
 
 module.exports = {
-  understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
+  understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss, writeCaptionAss,
   buildCues, placeCues, transcribeAudio, normalizeTranscriptCues,
   getLlmHealth, extractJson, safeFilter, normalizeOps,
+  resolveCaptionLayout, buildAssDocument, wrapCueText, positionLabel,
 }

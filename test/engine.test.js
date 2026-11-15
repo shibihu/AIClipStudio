@@ -11,8 +11,14 @@ const {
   understand, build, safeFilter, normalizeOps, extractJson,
   buildCues, placeCues, normalizeTranscriptCues,
 } = require('../ai')
+const { resolveBinaries } = require('../ffmpeg')
 
 const META = { duration: 20, width: 1280, height: 720, hasAudio: true, fps: 30 }
+
+test('resolveBinaries: Windows uses PATH instead of Linux vendored binaries', () => {
+  const binaries = resolveBinaries('C:/AIClipStudio', 'win32', 'x64', () => true)
+  assert.deepEqual(binaries, { ffmpeg: 'ffmpeg', ffprobe: 'ffprobe' })
+})
 
 // --- understand(): natural-language → op list ---------------------------------
 

@@ -35,10 +35,25 @@ const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
 const { execFile, spawn } = require('child_process')
+const { resolveBinaries } = require('./ffmpeg')
 const {
-  understand, understandWithLLM, build, makeTextOverlay, makeCaptionAss,
+  understand, understandWithLLM, build, makeTextOverlay, writeCaptionAss,
   buildCues, placeCues, transcribeAudio, normalizeTranscriptCues, getLlmHealth,
 } = require('./ai')
+const {
+  POSITIONS, DEFAULT_POSITION, SUBTITLE_MODES,
+  normalizePosition, normalizeMode, normalizeStyle, positionLabel,
+  parseSubtitleInstructions, resolveCaptionLayout, captionRegion, resolveFontFamily,
+} = require('./subtitle-layout')
+const {
+  detectBurnedInSubtitles, buildObscureGraph, verifyCaptionRender,
+} = require('./subtitle-removal')
+const {
+  formatRenderReport, formatRenderError, renderFacts, stripInternalDetails,
+  technicalDetails, maybeAttachTechnical, DEBUG_ENABLED,
+} = require('./render-report')
+const { buildFfmpegArgs, displayCommand } = require('./render-args')
+const { buildCaptionRender } = require('./caption-render')
 
 const ROOT = __dirname
 const PUBLIC = path.join(ROOT, 'public')
@@ -49,25 +64,9 @@ const RENDER_CONCURRENCY = 1 // serialize renders: one ffmpeg at a time
 fs.mkdirSync(JOBS, { recursive: true })
 
 // --- locate ffmpeg/ffprobe --------------------------------------------------
-// Binaries are vendored per-arch: ffmpeg-amd64 (Render x64) / ffmpeg-arm64.
-// Falls back to a plain vendor/ffmpeg, then to whatever is on PATH.
-const ARCH = process.arch === 'x64' ? 'amd64' : process.arch
-let FFMPEG = path.join(ROOT, 'vendor', `ffmpeg-${ARCH}`)
-let FFPROBE = path.join(ROOT, 'vendor', `ffprobe-${ARCH}`)
-try {
-  fs.accessSync(FFMPEG, fs.constants.X_OK)
-  fs.accessSync(FFPROBE, fs.constants.X_OK)
-} catch {
-  FFMPEG = path.join(ROOT, 'vendor', 'ffmpeg')
-  FFPROBE = path.join(ROOT, 'vendor', 'ffprobe')
-  try {
-    fs.accessSync(FFMPEG, fs.constants.X_OK)
-    fs.accessSync(FFPROBE, fs.constants.X_OK)
-  } catch {
-    FFMPEG = 'ffmpeg'
-    FFPROBE = 'ffprobe'
-  }
-}
+// Binaries are vendored per-arch for Linux/Render. Windows uses its native
+// FFmpeg installation from PATH because the bundled files are Linux binaries.
+const { ffmpeg: FFMPEG, ffprobe: FFPROBE } = resolveBinaries(ROOT)
 
 function findFont() {
   const candidates = [
@@ -373,29 +372,9 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
   const outName = `out-${job.next++}.${frag.output}`
   const outPath = path.join(JOBS, jobId, outName)
 
-  const args = ['-y', '-hide_banner', '-progress', 'pipe:1', '-nostats']
-  if (frag.seek && (frag.seek.from != null || frag.seek.to != null)) {
-    // fast-seek: -ss before -i stays frame-accurate for re-encode output
-    if (frag.seek.from != null) args.push('-ss', String(frag.seek.from))
-    args.push('-i', src)
-    if (frag.seek.to != null) args.push('-t', String(Math.max(0.05, frag.seek.to - (frag.seek.from || 0))))
-  } else {
-    args.push('-i', src)
-  }
-  if (frag.complex) args.push('-filter_complex', frag.complex)
-  else {
-    if (frag.vf.length) args.push('-vf', frag.vf.join(','))
-    if (frag.af.length) args.push('-af', frag.af.join(','))
-  }
-  if (frag.output === 'mp4') {
-    args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-movflags', '+faststart', '-pix_fmt', 'yuv420p')
-    if (frag.af.length) args.push('-c:a', 'aac', '-b:a', '160k')
-    else if (meta.hasAudio && !frag.extraArgs.includes('-an')) args.push('-c:a', 'copy')
-  }
-  if (frag.output === 'mp3') args.push('-vn')
-  args.push(...frag.extraArgs, outPath)
+  const args = buildFfmpegArgs({ frag, src, outPath, meta })
 
-  const cmdDisplay = `ffmpeg ${args.map((a) => (/[\s'"]/.test(a) && a !== outPath && !a.startsWith('-') ? `"${a}"` : a)).join(' ')}`
+  const cmdDisplay = displayCommand('ffmpeg', args, outPath)
 
   // expected output length drives the progress percentage
   let expected = Math.max(1, meta.duration || 1)
@@ -418,14 +397,21 @@ async function enqueueRender(job, jobId, srcName, frag, result, meta, userMsg) {
     userMsg,
     fromIndex: job.base,
     expected, proc: null, media: null, thumb: null, reply: null,
+    // structured, user-safe facts (captions/position/audio/detection) — the
+    // raw args stay server-side and only surface in explicit debug mode
+    facts: frag.facts || {},
+    errTail: '',
   }
   renders.set(rid, reg)
   renderQueue.push(rid)
+  // The raw command lives ONLY in this on-disk marker (server filesystem) and
+  // in the server log; it is never sent to a client unless EXPOSE_RENDER_DEBUG.
+  console.log(`[ai-studio] render ${jobId}/${outName} queued: ${cmdDisplay}`)
   try {
     await fsp.writeFile(path.join(JOBS, jobId, 'pending.json'), JSON.stringify({
       rid, srcName, args, cmdDisplay, outPath, outName,
       summary: reg.summary, ops: reg.ops, userMsg, fromIndex: job.base,
-      expected, createdAt: Date.now(),
+      expected, facts: reg.facts, createdAt: Date.now(),
     }))
   } catch { /* best-effort marker */ }
   pumpRenders()
@@ -481,9 +467,12 @@ async function startRender(reg) {
 
   const fail = (reg, errTail) => {
     reg.status = 'failed'
-    reg.reply = `⚠️ The edit failed while rendering:\n\n${errTail || 'unknown ffmpeg error'}\n\nAsk me differently and I'll retry.`
+    reg.failureHint = 'I hit a problem while rendering that edit.'
+    reg.reply = formatRenderReport(reg)
   }
   fsp.rm(path.join(JOBS, reg.jobId, 'pending.json'), { force: true }).catch(() => {})
+  reg.finishedAt = Date.now()
+  reg.errTail = errTail
   if (code === 0) {
     const outMeta = await probe(reg.outPath)
     const thumbName = `thumb-${reg.outName}.jpg`
@@ -492,13 +481,28 @@ async function startRender(reg) {
     reg.thumb = thumbOk ? `/media/${reg.jobId}/${encodeURIComponent(thumbName)}` : null
     reg.progress = 100
     reg.status = 'done'
+    reg.facts = { ...reg.facts, outputDuration: outMeta.duration }
+
+    // Pixel-level verification: did the render actually do what the report
+    // claims? Measured, never assumed.
+    if (reg.verify) {
+      try {
+        const sourcePath = path.join(JOBS, reg.jobId, reg.srcName)
+        const verification = await verifyCaptionRender(FFMPEG, sourcePath, reg.outPath, outMeta, {
+          oldBand: reg.verify.oldBand,
+          newBand: reg.verify.newBand,
+        })
+        reg.facts.verification = verification
+        console.log(`[ai-studio] verify ${reg.jobId}/${reg.outName}: ${JSON.stringify(verification)}`)
+      } catch (e) {
+        console.error('[ai-studio] render verification failed:', e.message)
+      }
+    }
+    reg.reply = formatRenderReport(reg)
 
     const job = getJob(reg.jobId)
     if (job) {
       const vN = job.versions.length + 1
-      reg.reply =
-        `${reg.fromIndex === job.versions.length - 1 ? '✅' : '✅ (from v' + (reg.fromIndex + 1) + ')'} Done — ${reg.summary}.` +
-        `${outMeta.duration ? ` New length: ${outMeta.duration}s.` : ''} I ran:\n\n\`${reg.cmdDisplay}\`\n\nWhat's next?`
       job.versions.push({ name: reg.outName, desc: reg.summary, thumb: reg.thumb, meta: { duration: outMeta.duration, width: outMeta.width, height: outMeta.height, hasVideo: outMeta.hasVideo, hasAudio: outMeta.hasAudio, fps: outMeta.fps } })
       // audio-only outputs (exported mp3) become a version, but the edit base
       // must stay on video — editing "from" an mp3 is what caused
@@ -516,7 +520,8 @@ async function startRender(reg) {
       job.msgs.push({ role: 'user', content: reg.userMsg }, { role: 'assistant', content: reg.reply })
       await saveJob(job, reg.jobId)
     }
-    console.log(`[ai-studio] render ${reg.jobId}/${reg.outName} FAILED:\n${errTail}`)
+    // detailed stderr stays in the server log only
+    console.error(`[ai-studio] render ${reg.jobId}/${reg.outName} FAILED:\n${errTail}\ncommand: ${reg.cmdDisplay}`)
   }
 }
 
@@ -546,6 +551,7 @@ async function rehydrateRenders() {
         summary: pend.summary || '', ops: pend.ops || [],
         userMsg: pend.userMsg, fromIndex: pend.fromIndex ?? null,
         expected: pend.expected || 0, proc: null, media: null, thumb: null, reply: null,
+        facts: pend.facts || {}, errTail: '',
       })
       // the marker stays until this requeued render finishes (startRender removes it)
       renderQueue.push(pend.rid)
@@ -658,6 +664,13 @@ function llmFallbackNote(now = Date.now()) {
   if (!h.lastErrorAt || now - h.lastErrorAt > 2 * 60 * 1000) return ''
   const detail = h.lastError ? ` (${String(h.lastError).slice(0, 140)})` : ''
   return `\n\nℹ️ The AI service seems unreachable${detail} — this answer came from the built-in offline engine, so more exotic requests may not be understood right now.`
+}
+
+// Every string a client reads passes through here. Raw FFmpeg commands, server
+// paths and stderr never belong in a chat reply, even if some upstream text
+// accidentally contains them.
+function publicReply(text) {
+  return stripInternalDetails(text)
 }
 
 // --- rate limiting: small sliding-window buckets per ip+route -----------------
@@ -773,6 +786,18 @@ const server = http.createServer(async (req, res) => {
         llm: getLlmHealth(),
         auth: !!AUTH_TOKEN,
         renders: { active: activeRuns, queued: renderQueue.length, concurrency: RENDER_CONCURRENCY },
+        // Capability flags let the Android client fail loudly instead of
+        // silently dropping a setting this deployment does not support.
+        capabilities: {
+          androidSkills: true,
+          captionInstructions: true,
+          subtitlePositioning: true,
+          subtitlePositions: POSITIONS,
+          subtitleModes: SUBTITLE_MODES,
+          subtitleStyle: true,
+          burnedInSubtitleDetection: true,
+          renderDebugMode: DEBUG_ENABLED(),
+        },
       })
     }
 
@@ -885,13 +910,13 @@ const server = http.createServer(async (req, res) => {
           '⏪ FX — “reverse”, “boomerang”, “blur”, “black and white”, “vintage”',
           '🎨 Color — “brighter”, “more colorful”, “more contrast”',
           '🕐 Versions — click any version below the player to preview it; ★ pins it as the base',
-          '🧪 Anything else ffmpeg can do — “add a vignette”, “fade in 1s”, “remove the bass”…',
+          '🧪 More effects — “add a vignette”, “fade in 1s”, “remove the bass”…',
           '',
           'You can chain edits in one message — e.g. “cut the first 3s, make it square, add text HI at the top”.',
           'You can also just ask questions — “would this work as a TikTok?” and I’ll answer.',
-          'Each reply shows the real ffmpeg command it ran.',
+          'Every finished edit ends with a short summary: captions, length, subtitle position and whether the audio was kept.',
         ]
-        const reply = 'Here\'s what I can do with your clip:\n' + list.join('\n')
+        const reply = publicReply('Here\'s what I can do with your clip:\n' + list.join('\n'))
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null })
       }
@@ -909,7 +934,7 @@ const server = http.createServer(async (req, res) => {
 
       // LLM chose a conversational answer (question / advice / chit-chat)
       if (result && result.isChat) {
-        const reply = result.reply
+        const reply = publicReply(result.reply)
         job.msgs.push({ role: 'user', content: message }, { role: 'assistant', content: reply })
         return json(res, 200, { reply, commands: [], media: null, engine: 'llm-chat' })
       }
@@ -946,15 +971,17 @@ const server = http.createServer(async (req, res) => {
       const { rid } = await enqueueRender(job, id, srcName, frag, result, meta, message)
       const summary = result.summary || frag.desc.join(' + ')
       const queued = renderQueue.length
-      const reply = `${result.isLLM ? '🤖 (LLM) ' : '🛠 '}Rendering: ${summary} ⏳ (${queued ? `queued — ${queued} render${queued === 1 ? '' : 's'} ahead` : 'starting now'})` + (result.isLLM ? '' : llmFallbackNote())
-      return json(res, 200, {
+      const reply = publicReply(`${result.isLLM ? '🤖 (LLM) ' : '🛠 '}Rendering: ${summary} ⏳ (${queued ? `queued — ${queued} render${queued === 1 ? '' : 's'} ahead` : 'starting now'})` + (result.isLLM ? '' : llmFallbackNote()))
+      const payload = {
         reply,
         summary,
         ops: frag.desc,
-        commands: [renders.get(rid).cmdDisplay],
+        commands: [],
         engine: result.isLLM ? 'llm' : 'local',
         renderId: rid,
-      })
+      }
+      const reg = renders.get(rid)
+      return json(res, 200, reg ? maybeAttachTechnical(reg, payload) : payload)
     }
 
     // ---- render polling ----
@@ -965,10 +992,29 @@ const server = http.createServer(async (req, res) => {
       if (!reg || reg.jobId !== id) return json(res, 404, { error: 'render not found (server restarted?) — send the edit again' })
       if (reg.status === 'queued') return json(res, 200, { status: 'queued', progress: 0, queuedAhead: Math.max(0, renderQueue.indexOf(rid)) })
       if (reg.status === 'running') return json(res, 200, { status: 'running', progress: reg.progress })
-      return json(res, 200, {
-        status: reg.status, progress: reg.progress, reply: reg.reply,
-        media: reg.media, summary: reg.summary, ops: reg.ops, commands: [reg.cmdDisplay],
-      })
+      const facts = renderFacts(reg)
+      const payload = {
+        status: reg.status,
+        progress: reg.progress,
+        reply: stripInternalDetails(reg.reply || ''),
+        media: reg.media,
+        summary: reg.summary,
+        ops: reg.ops,
+        // structured summary — the same numbers the chat reply is built from
+        captions: facts.captions,
+        subtitlePosition: facts.subtitlePosition,
+        subtitlePositionLabel: facts.subtitlePositionLabel,
+        outputDuration: facts.outputDuration,
+        audioPreserved: facts.audioPreserved,
+        audio: reg.facts?.audio || null,
+        detection: facts.detection,
+        verification: facts.verification,
+        mode: facts.mode,
+        success: facts.success,
+        // kept for API compatibility; only populated in explicit debug mode
+        commands: [],
+      }
+      return json(res, 200, maybeAttachTechnical(reg, payload))
     }
 
     if (p === '/api/job' && req.method === 'GET') {
@@ -1035,8 +1081,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- captions: paste script → silence-timed burn-in, or auto-transcribe ----
+    // Request fields (all optional, existing shape still works):
+    //   position   one of POSITIONS (top_center … bottom_right)
+    //   style      { fontSize, fontFamily, textColor, outlineWidth, background,
+    //                backgroundOpacity, maxLines, safeMarginX, safeMarginY }
+    //   mode       'add' (default) | 'replace' (obscure burned-in captions first)
+    //   instructions  free-form text; an explicit position inside it wins
     if (p === '/api/captions' && req.method === 'POST') {
-      const { id, text, auto } = await readJson(req)
+      const body = await readJson(req)
+      const { id, text, auto, instructions, layer } = body
       const job = getJob(id)
       if (!job) return json(res, 404, { error: 'unknown job — upload a clip first' })
       const srcName = job.versions[job.base].name
@@ -1053,10 +1106,28 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { reply, commands: [], media: null })
       }
 
+      // ---- resolved caption layout (position + style + wrapping budget) ----
+      const parsedInstructions = parseSubtitleInstructions(instructions)
+      const layout = resolveCaptionLayout({
+        instructions,
+        position: body.position,
+        style: body.style,
+        layer,
+      }, meta)
+      if (layout.warnings.length) {
+        console.log(`[ai-studio] captions ${id}: ${layout.warnings.join(' | ')}`)
+      }
+      // Add vs Replace: an explicit UI choice is honoured, but subtitle-specific
+      // wording in the instructions can never be silently dropped.
+      const fieldMode = normalizeMode(body.mode)
+      const mode = parsedInstructions.explicitMode ? parsedInstructions.mode : (fieldMode || 'add')
+      if (fieldMode && parsedInstructions.explicitMode && fieldMode !== parsedInstructions.mode) {
+        layout.warnings.push(`request asked to ${fieldMode} while the instruction asked to ${parsedInstructions.mode} — following the instruction`)
+      }
+
       let placed = null
-      let summary = ''
-      let userMsg = ''
       let captionSource = ''
+      let userMsg = ''
       if (auto) {
         // ---- STT path: extract a small mono audio track, transcribe, burn ---
         const audioName = `stt-${srcName.replace(/\W+/g, '_')}.mp3`
@@ -1067,37 +1138,96 @@ const server = http.createServer(async (req, res) => {
           const r = await run(FFMPEG, ['-y', '-hide_banner', '-i', src, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '48k', '-map', 'a:0', audioPath], 300000)
           if (!r.ok) return json(res, 500, { error: 'audio extraction failed' })
         }
-        const raw = await transcribeAudio(audioPath, meta)
-        placed = raw && raw.length ? normalizeTranscriptCues(raw, meta) : null
+        const raw = await transcribeAudio(audioPath, meta, { instructions })
+        placed = raw && raw.length
+          ? normalizeTranscriptCues(raw, meta, { maxChars: layout.maxChars, maxLines: layout.maxLines })
+          : null
         if (!placed || !placed.length) {
           console.log(`[ai-studio] auto-captions ${id}: STT returned ${raw ? raw.length : 'no'} cue(s) — falling back to manual script`)
-          const reply = "I couldn't auto-transcribe this clip (the LLM isn't reachable, or there's no clear speech). You can paste your script instead — ✨ pasted captions are timed with silence detection and need no cloud."
+          const reply = "I couldn't auto-transcribe this clip (the speech service isn't reachable, or there's no clear speech). You can paste your script instead — ✨ pasted captions are timed with silence detection and need no cloud."
           job.msgs.push({ role: 'user', content: 'auto-transcribe captions' }, { role: 'assistant', content: reply })
           await saveJob(job, id)
           return json(res, 200, { reply, commands: [], media: null })
         }
-        summary = `burned in ${placed.length} auto-transcribed caption${placed.length === 1 ? '' : 's'}`
         userMsg = '🎙 auto-transcribe and caption the spoken words'
       } else {
-        // ---- pasted-script path (unchanged behaviour) -------------------------
+        // ---- pasted-script path ---------------------------------------------
         const script = String(text || '').slice(0, 5000)
-        const cues = buildCues(script)
+        const cues = buildCues(script, { maxChars: layout.maxChars, maxLines: layout.maxLines })
         if (!cues.length) return json(res, 400, { reply: 'Give me at least one line of script text to caption.' })
         const segs = await speechSegments(src, meta)
         placed = placeCues(cues, segs)
         if (!placed.length) return json(res, 400, { reply: 'No speech segments found — the clip may be all music/silence. Try a manual text overlay instead.' })
-        summary = `burned in ${placed.length} caption lines`
         userMsg = `add captions:\n${script.slice(0, 400)}${script.length > 400 ? '…' : ''}`
         captionSource = ` on ${segs.length} detected speech segment${segs.length === 1 ? '' : 's'}`
       }
-      const vf = makeCaptionAss(placed, meta, path.join(JOBS, id))
-      const frag = { vf: [vf], af: [], extraArgs: [], complex: null, output: 'mp4', desc: [summary] }
-      const render = await enqueueRender(job, id, srcName, frag, { summary, ops: frag.desc }, meta, userMsg)
+
+      // ---- replace mode: detect + obscure existing burned-in subtitles -----
+      let detection = null
+      let obscure = null
+      if (mode === 'replace') {
+        detection = await detectBurnedInSubtitles(FFMPEG, src, meta, { samples: 24 })
+        if (detection.found && detection.band) {
+          obscure = buildObscureGraph(detection.band, meta)
+          console.log(`[ai-studio] captions ${id}: burned-in band ${JSON.stringify(obscure.band)} confidence ${detection.confidence}`)
+        } else {
+          console.log(`[ai-studio] captions ${id}: no burned-in subtitles to obscure — ${detection.reason}`)
+        }
+      } else {
+        detection = {
+          found: false,
+          skipped: true,
+          reason: 'add mode never modifies existing video content, so burned-in text was left untouched',
+        }
+      }
+
+      const caption = buildCaptionRender({
+        placed,
+        meta,
+        dir: path.join(JOBS, id),
+        layout,
+        mode,
+        detection,
+        layer: layout.layer,
+      })
+      const { frag } = caption
+      frag.facts = caption.facts
+      frag.verify = caption.verify
+      const captionCount = placed.length
+      const summary = caption.summary
+
+      const renderResult = { summary, ops: frag.desc }
+      const render = await enqueueRender(job, id, srcName, frag, renderResult, meta, userMsg)
       const { rid } = render
-      const reply = `💬 Placing ${placed.length} caption line${placed.length === 1 ? '' : 's'}${auto ? ' from the transcribed speech' : captionSource} — rendering ⏳`
+      const positionText = caption.positionLabel
+      const reply = publicReply(
+        `💬 ${caption.obscure ? 'Replacing the old subtitles and placing' : 'Placing'} ${captionCount} caption${captionCount === 1 ? '' : 's'} at ${positionText}` +
+        `${auto ? ' from the transcribed speech' : captionSource} — rendering ⏳`,
+      )
       job.msgs.push({ role: 'user', content: userMsg }, { role: 'assistant', content: reply + ' (started)' })
       await saveJob(job, id)
-      return json(res, 200, { reply, renderId: rid, summary, ops: frag.desc, commands: [] })
+      return json(res, 200, {
+        reply,
+        renderId: rid,
+        summary,
+        ops: frag.desc,
+        commands: [],
+        captions: captionCount,
+        position: layout.position,
+        positionLabel: positionText,
+        alignment: layout.alignment,
+        positionSource: layout.positionSource,
+        mode,
+        detection,
+        style: {
+          fontSize: layout.style.fontSize,
+          fontFamily: resolveFontFamily(layout.style, placed.map((c) => c.text).join(' ')),
+          maxLines: layout.style.maxLines,
+          safeMarginX: layout.style.safeMarginX,
+          safeMarginY: layout.style.safeMarginY,
+        },
+        warnings: layout.warnings,
+      })
     }
 
     return send(res, 404, 'not found')
