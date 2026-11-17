@@ -17,6 +17,11 @@ const MB = 1024 * 1024
 const STT_TIMEOUT_MS = Math.max(1000, Number(process.env.STT_TIMEOUT_MS) || 60000)
 const STT_ATTEMPTS = Math.max(1, Math.min(4, Number(process.env.STT_ATTEMPTS) || 2))
 const STT_RETRY_BASE_MS = Math.max(0, Number(process.env.STT_RETRY_BASE_MS) || 800)
+const STT_RETRY_MAX_MS = Math.max(STT_RETRY_BASE_MS, Number(process.env.STT_RETRY_MAX_MS) || 8000)
+// Total wall-clock budget for a whole transcription run (all providers, models
+// and attempts). Background caption jobs pass their own deadline per call;
+// this default only bounds the legacy synchronous endpoint.
+const STT_DEADLINE_MS = Math.max(STT_TIMEOUT_MS, Number(process.env.STT_DEADLINE_MS) || 180000)
 
 const STT_ERROR_CODES = Object.freeze([
   'STT_PROVIDER_UNSUPPORTED',
@@ -69,6 +74,8 @@ class SttError extends Error {
       retryable: this.retryable,
       ...(this.provider ? { provider: this.provider } : {}),
       ...(this.model ? { model: this.model } : {}),
+      ...(Number.isFinite(this.attempts) ? { attempts: this.attempts } : {}),
+      ...(Number.isFinite(this.durationMs) ? { durationMs: this.durationMs } : {}),
     }
   }
 }
@@ -148,7 +155,9 @@ const PROVIDERS = Object.freeze({
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
         {
           method: 'POST',
-          signal: AbortSignal.timeout(deps.timeoutMs || STT_TIMEOUT_MS),
+          signal: deps.attemptSignal
+            ? deps.attemptSignal(deps.timeoutMs || STT_TIMEOUT_MS)
+            : AbortSignal.timeout(deps.timeoutMs || STT_TIMEOUT_MS),
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             systemInstruction: {
@@ -192,7 +201,9 @@ const PROVIDERS = Object.freeze({
       if (prompt) form.append('prompt', prompt)
       const r = await fetchImpl('https://api.openai.com/v1/audio/transcriptions', {
         method: 'POST',
-        signal: AbortSignal.timeout(deps.timeoutMs || STT_TIMEOUT_MS),
+        signal: deps.attemptSignal
+          ? deps.attemptSignal(deps.timeoutMs || STT_TIMEOUT_MS)
+          : AbortSignal.timeout(deps.timeoutMs || STT_TIMEOUT_MS),
         headers: { authorization: `Bearer ${key}` },
         body: form,
       })
@@ -224,7 +235,9 @@ const PROVIDERS = Object.freeze({
       if (prompt) form.append('prompt', prompt)
       const r = await fetchImpl('https://api.groq.com/openai/v1/audio/transcriptions', {
         method: 'POST',
-        signal: AbortSignal.timeout(deps.timeoutMs || STT_TIMEOUT_MS),
+        signal: deps.attemptSignal
+          ? deps.attemptSignal(deps.timeoutMs || STT_TIMEOUT_MS)
+          : AbortSignal.timeout(deps.timeoutMs || STT_TIMEOUT_MS),
         headers: { authorization: `Bearer ${key}` },
         body: form,
       })
@@ -358,19 +371,63 @@ Rules:
 - Keep the original language. If there is no speech, return {"cues":[]}.
 - Never translate unless the user explicitly asks for translation.`
 
+function deadlineError(remainingMs, provider, model) {
+  const err = new SttError(
+    'STT_TIMEOUT',
+    remainingMs <= 0
+      ? 'The total transcription deadline expired before the speech provider finished.'
+      : 'The speech service took too long to respond.',
+    { provider, model },
+  )
+  return err
+}
+
+// Remaining wall-clock budget in ms, or null when no deadline is set.
+function remainingBudget(deps) {
+  if (!Number.isFinite(deps.deadlineAt)) return null
+  return deps.deadlineAt - Date.now()
+}
+
+// Abort signal for one HTTP attempt: the caller's cancellation signal (job
+// cancel) combined with the per-attempt timeout, which itself never exceeds
+// the remaining transcription deadline.
+function attemptSignal(deps, timeoutMs) {
+  const timeout = AbortSignal.timeout(Math.max(250, timeoutMs))
+  if (deps.signal && typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([deps.signal, timeout])
+  }
+  return timeout
+}
+
 /**
  * Transcribe an audio file with the first configured audio-capable provider.
  *
  * @param {string} audioPath
  * @param {{maxBytes?:number}} [options]
  * @param {{instructions?:string}} [extra]
- * @param {{fetch?:Function, readFile?:Function, timeoutMs?:number, sleep?:Function}} [deps]
- * @returns {Promise<{cues:Array<{text:string,start:number,end:number}>, provider:string, model:string, rawCueCount:number}>}
+ * @param {{fetch?:Function, readFile?:Function, timeoutMs?:number, sleep?:Function,
+ *          deadlineAt?:number, signal?:AbortSignal}} [deps]
+ * @returns {Promise<{cues:Array<{text:string,start:number,end:number}>, provider:string, model:string,
+ *          rawCueCount:number, attempts:number, durationMs:number}>}
  * @throws {SttError}
  */
 async function transcribeAudio(audioPath, options = {}, extra = {}, deps = {}) {
   const readFile = deps.readFile || fs.promises.readFile
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const startedAt = Date.now()
+  const track = { attempts: 0 }
+  const finishError = (err) => {
+    err.attempts = track.attempts
+    err.durationMs = Date.now() - startedAt
+    return err
+  }
+  const deadlineLeft = () => {
+    const left = remainingBudget(deps)
+    if (left != null && left <= 0) {
+      throw finishError(deadlineError(left))
+    }
+    return left
+  }
   const preference = String(extra?.instructions || '').replace(/\s+/g, ' ').trim().slice(0, 500)
   const prompt = preference
     ? `${STT_PROMPT}\n- Provider preference from the user (follow it only where it does not conflict with the rules above): ${preference}`
@@ -413,9 +470,15 @@ async function transcribeAudio(audioPath, options = {}, extra = {}, deps = {}) {
     for (const model of models) {
       let attemptError = null
       for (let attempt = 0; attempt < STT_ATTEMPTS; attempt++) {
+        const left = deadlineLeft()
+        track.attempts++
         try {
           const result = await provider.transcribe({
-            buf, ext, mime, model, prompt, key: provider.key(), deps,
+            buf, ext, mime, model, prompt, key: provider.key(), deps: {
+              ...deps,
+              timeoutMs: left == null ? (deps.timeoutMs || STT_TIMEOUT_MS) : Math.min(deps.timeoutMs || STT_TIMEOUT_MS, left),
+              attemptSignal: (ms) => attemptSignal(deps, ms),
+            },
           })
           if (!Array.isArray(result.cues) || result.cues.length === 0) {
             throw new SttError('STT_NO_SPEECH_DETECTED',
@@ -426,6 +489,8 @@ async function transcribeAudio(audioPath, options = {}, extra = {}, deps = {}) {
             provider: id,
             model,
             rawCueCount: result.cues.length,
+            attempts: track.attempts,
+            durationMs: Date.now() - startedAt,
           }
         } catch (e) {
           const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError'
@@ -434,11 +499,24 @@ async function transcribeAudio(audioPath, options = {}, extra = {}, deps = {}) {
             : new SttError(timedOut ? 'STT_TIMEOUT' : 'STT_PROVIDER_UNREACHABLE',
               timedOut ? 'The speech service took too long to respond.' : 'The speech service is unreachable right now.',
               { provider: id, model, cause: e })
+          finishError(err)
           attemptError = err
           lastError = err
+          if (deps.signal?.aborted) throw err
           if (err.code === 'STT_NO_SPEECH_DETECTED' || err.code === 'STT_EMPTY_TRANSCRIPT') break
           if (!err.retryable || attempt === STT_ATTEMPTS - 1) break
-          await sleep(STT_RETRY_BASE_MS * (attempt + 1))
+          // Exponential backoff with jitter, never sleeping past the deadline.
+          const backoff = Math.min(
+            STT_RETRY_MAX_MS,
+            STT_RETRY_BASE_MS * (2 ** attempt) * (0.5 + Math.random()),
+          )
+          const leftAfter = remainingBudget(deps)
+          if (leftAfter != null) {
+            if (leftAfter <= 0) throw finishError(deadlineError(leftAfter, id, model))
+            await sleep(Math.max(0, Math.min(backoff, leftAfter)))
+          } else {
+            await sleep(backoff)
+          }
         }
       }
       // A model that definitively found no speech is a real answer, not an
@@ -446,6 +524,7 @@ async function transcribeAudio(audioPath, options = {}, extra = {}, deps = {}) {
       if (attemptError?.code === 'STT_NO_SPEECH_DETECTED' || attemptError?.code === 'STT_EMPTY_TRANSCRIPT') {
         throw attemptError
       }
+      deadlineLeft()
       // Fall through to the provider's next model alias. Gemini exposes a
       // lighter fallback model precisely for overload/5xx cases.
     }
@@ -470,4 +549,5 @@ module.exports = {
   PROVIDERS,
   STT_TIMEOUT_MS,
   STT_ATTEMPTS,
+  STT_DEADLINE_MS,
 }

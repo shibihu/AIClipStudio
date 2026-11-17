@@ -36,10 +36,10 @@ function headers(extra = {}) {
   return { 'x-auth-token': TOKEN, ...extra }
 }
 
-async function postJson(pathname, body) {
+async function postJson(pathname, body, extra = {}) {
   return fetch(`${BASE}${pathname}`, {
     method: 'POST',
-    headers: headers({ 'content-type': 'application/json' }),
+    headers: headers({ 'content-type': 'application/json', ...extra }),
     body: JSON.stringify(body),
   })
 }
@@ -81,7 +81,7 @@ test('health is public and advertises version, schema and STT capabilities', asy
   const body = await r.json()
   assert.equal(body.ok, true)
   assert.equal(body.backend.name, 'ai-clip-studio')
-  assert.equal(body.backend.apiSchemaVersion, 2)
+  assert.equal(body.backend.apiSchemaVersion, 3)
   assert.match(body.backend.version, /^\d+\.\d+\.\d+/)
   assert.equal(body.capabilities.subtitlePositioning, true)
   assert.deepEqual(body.capabilities.subtitlePositions, [
@@ -100,7 +100,7 @@ test('GET /api/version requires auth but returns the same capability contract', 
   const r = await fetch(`${BASE}/api/version`, { headers: headers() })
   assert.equal(r.status, 200)
   const body = await r.json()
-  assert.equal(body.apiSchemaVersion, 2)
+  assert.equal(body.apiSchemaVersion, 3)
   assert.equal(body.capabilities.sceneDetection, true)
   assert.equal(body.limits.maxRenderQueue, 2)
 })
@@ -167,4 +167,63 @@ test('upload accepts real video, scene detection runs, and STT errors are struct
   assert.equal(captionBody.error.code, 'STT_API_KEY_MISSING')
   assert.equal(captionBody.error.retryable, false)
   assert.ok(captionBody.reply)
+})
+
+test('background caption jobs: submit, dedupe, poll, structured failure, cancel', async () => {
+  // missing idempotency key is rejected before any work
+  const noKey = await postJson('/api/captions/jobs', { id: jobId })
+  assert.equal(noKey.status, 400)
+  assert.equal((await noKey.json()).error.code, 'IDEMPOTENCY_KEY_REQUIRED')
+
+  // Concurrent submissions with one idempotency key return ONE task. (The
+  // pipeline without STT keys fails in ~1.7s, so the duplicate check must run
+  // while the first task is still in flight.)
+  const [r1, r2] = await Promise.all([
+    postJson('/api/captions/jobs', { id: jobId, instructions: 'Thai' }, { 'Idempotency-Key': 'api-test-key-1' }),
+    postJson('/api/captions/jobs', { id: jobId, instructions: 'Thai' }, { 'Idempotency-Key': 'api-test-key-1' }),
+  ])
+  assert.equal(r1.status, 202)
+  assert.equal(r2.status, 202)
+  const submitted = await r1.json()
+  const dupBody = await r2.json()
+  assert.equal(dupBody.taskId, submitted.taskId, 'concurrent submissions with one key must yield one task')
+  assert.match(submitted.taskId, /^[a-zA-Z0-9_-]{1,128}$/)
+  assert.ok(submitted.createdAt && submitted.updatedAt)
+
+  // status endpoint exposes the documented shape while the worker runs
+  const status = await fetch(`${BASE}/api/captions/jobs/${submitted.taskId}?id=${jobId}`, { headers: headers() })
+  assert.equal(status.status, 200)
+  const statusBody = await status.json()
+  for (const field of ['taskId', 'status', 'stage', 'progress', 'renderId', 'error', 'createdAt', 'updatedAt']) {
+    assert.ok(field in statusBody, `status must include ${field}`)
+  }
+
+  // no STT key in this child process → the worker must fail the task with a
+  // structured, retryable-flagged error after real extraction. Never "stuck
+  // queued", never "completed".
+  let final = null
+  for (let i = 0; i < 200; i++) {
+    const poll = await fetch(`${BASE}/api/captions/jobs/${submitted.taskId}?id=${jobId}`, { headers: headers() })
+    const body = await poll.json()
+    if (['completed', 'failed', 'cancelled'].includes(body.stage)) { final = body; break }
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  assert.ok(final, 'task must reach a terminal stage')
+  assert.equal(final.stage, 'failed')
+  assert.equal(final.error.code, 'STT_API_KEY_MISSING')
+  assert.equal(final.metrics.failureStage, 'transcribing')
+
+  // GET with an invalid job id is rejected; unknown task is a 404
+  const badJob = await fetch(`${BASE}/api/captions/jobs/${submitted.taskId}?id=../../etc`, { headers: headers() })
+  assert.equal(badJob.status, 400)
+  const missing = await fetch(`${BASE}/api/captions/jobs/does-not-exist?id=${jobId}`, { headers: headers() })
+  assert.equal(missing.status, 404)
+
+  // a fresh task can be cancelled while queued
+  const submit2 = await postJson('/api/captions/jobs', { id: jobId }, { 'Idempotency-Key': 'api-test-key-2' })
+  const task2 = (await submit2.json()).taskId
+  const cancel = await fetch(`${BASE}/api/captions/jobs/${task2}?id=${jobId}`, { method: 'DELETE', headers: headers() })
+  assert.equal(cancel.status, 200)
+  const cancelled = await cancel.json()
+  assert.ok(['cancelled', 'failed'].includes(cancelled.stage), 'cancel must land in a terminal stage')
 })

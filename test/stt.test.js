@@ -225,3 +225,50 @@ test('capabilities list only audio providers and expose limits', () => {
   assert.ok(caps.errorCodes.includes('STT_NO_SPEECH_DETECTED'))
   assert.ok(caps.providers.every((p) => p.maxBytes > 0 && p.formats.includes('.mp3')))
 })
+
+test('an expired total deadline fails before any provider call', async () => {
+  setEnv({ GEMINI_API_KEY: 'g-test' })
+  let called = false
+  await assert.rejects(
+    () => transcribeAudio('/tmp/audio.mp3', {}, {}, deps(async () => {
+      called = true
+      return jsonResponse(geminiBody([{ text: 'late', start: 0, end: 1 }]))
+    }, { deadlineAt: Date.now() - 5 })),
+    (error) => {
+      assert.equal(error.code, 'STT_TIMEOUT')
+      assert.equal(error.attempts, 0)
+      assert.ok(error.durationMs >= 0)
+      return true
+    },
+  )
+  assert.equal(called, false, 'no provider request may run past the deadline')
+})
+
+test('retries and fallbacks stop at the total deadline', async () => {
+  setEnv({ GEMINI_API_KEY: 'g-test', STT_ATTEMPTS: '4', STT_MODEL: 'gemini-flash-latest' })
+  const deadlineAt = Date.now() + 30
+  let calls = 0
+  await assert.rejects(
+    () => transcribeAudio('/tmp/audio.mp3', {}, {}, deps(async () => {
+      calls++
+      return jsonResponse({ error: 'overloaded' }, 503)
+    }, {
+      deadlineAt,
+      // real (short) sleeps so the mocked clock advances to the deadline
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    })),
+    (error) => error.code === 'STT_TIMEOUT',
+  )
+  assert.ok(calls <= 2, `expected the deadline to cap retries, got ${calls} attempts`)
+})
+
+test('successful transcription reports attempt count and duration', async () => {
+  setEnv({ GEMINI_API_KEY: 'g-test', STT_ATTEMPTS: '2' })
+  let calls = 0
+  const result = await transcribeAudio('/tmp/audio.mp3', {}, {}, deps(async () => {
+    calls++
+    return calls === 1 ? jsonResponse({ error: 'x' }, 503) : jsonResponse(geminiBody([{ text: 'ok', start: 0, end: 1 }]))
+  }))
+  assert.equal(result.attempts, 2)
+  assert.ok(result.durationMs >= 0)
+})

@@ -58,6 +58,7 @@ const {
 const { buildFfmpegArgs, displayCommand } = require('./render-args')
 const { buildCaptionRender } = require('./caption-render')
 const { CaptionTaskStore } = require('./caption-jobs')
+const { CaptionWorker } = require('./caption-worker')
 
 const ROOT = __dirname
 const PUBLIC = path.join(ROOT, 'public')
@@ -65,8 +66,8 @@ const JOBS = path.join(ROOT, 'jobs')
 const MAX_UPLOAD = 1024 * 1024 * 1024 // 1 GB
 const RENDER_CONCURRENCY = 1 // serialize renders: one ffmpeg at a time
 const MAX_RENDER_QUEUE = Math.max(1, Math.min(64, Number(process.env.MAX_RENDER_QUEUE) || 8))
-const BACKEND_VERSION = '1.1.0'
-const API_SCHEMA_VERSION = 2
+const BACKEND_VERSION = '1.2.0'
+const API_SCHEMA_VERSION = 3
 const UPLOAD_AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'aiff', 'aif', 'mpga'])
 const UPLOAD_VIDEO_EXT = new Set(['mp4', 'mov', 'webm', 'mkv', 'm4v', 'avi', 'gif'])
 const captionTasks = new CaptionTaskStore(JOBS)
@@ -82,6 +83,7 @@ const CAPABILITIES = Object.freeze({
   sceneDetection: true,
   renderValidation: true,
   structuredSttErrors: true,
+  captionBackgroundJobs: true,
   apiSchemaVersion: API_SCHEMA_VERSION,
   stt: null, // filled from stt.js (keys can change between requests in dev)
 })
@@ -679,6 +681,94 @@ async function rehydrateRenders() {
   if (renderQueue.length) pumpRenders()
 }
 
+// --- background caption worker -----------------------------------------------
+// Automatic-subtitle tasks (POST /api/captions/jobs) are persisted, then
+// processed here instead of inside the HTTP request. The worker owns the full
+// stage lifecycle; server.js only submits, cancels and recovers tasks.
+
+// Resolves when a render registry entry settles. Used by the caption worker to
+// track the FFmpeg render it enqueued (also across a restart via rehydrateRenders).
+function waitForRender(rid, { signal, onProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    let lastProgress = -1
+    const cleanup = () => clearInterval(timer)
+    const tick = () => {
+      if (signal?.aborted) {
+        cleanup()
+        return reject(Object.assign(new Error('caption task cancelled'), { code: 'CAPTION_CANCELLED' }))
+      }
+      const reg = renders.get(rid)
+      if (!reg) {
+        cleanup()
+        return reject(Object.assign(new Error('render lost'), { code: 'RENDER_LOST' }))
+      }
+      if (reg.progress !== lastProgress) {
+        lastProgress = reg.progress
+        try { onProgress?.(reg.progress) } catch { /* progress is best-effort */ }
+      }
+      if (reg.status === 'done') {
+        cleanup()
+        return resolve({ status: 'done', media: reg.media, reply: reg.reply })
+      }
+      if (reg.status === 'failed') {
+        cleanup()
+        return resolve({ status: 'failed', reply: reg.reply })
+      }
+    }
+    const timer = setInterval(tick, 1000)
+    tick()
+  })
+}
+
+const captionWorker = new CaptionWorker({
+  store: captionTasks,
+  jobsDir: JOBS,
+  ffmpeg: FFMPEG,
+  probe,
+  transcribeAudio,
+  SttError,
+  normalizeTranscriptCues,
+  detectBurnedInSubtitles,
+  buildObscureGraph,
+  buildCaptionRender,
+  enqueueCaptionRender: async (task, { frag, result, meta, srcName, userMsg }) => {
+    const job = getJob(task.jobId)
+    if (!job) throw new Error('source job missing for caption render')
+    const { rid } = await enqueueRender(job, task.jobId, srcName, frag, result, meta, userMsg)
+    return { rid }
+  },
+  waitForRender,
+  killRender: (rid) => {
+    const reg = renders.get(rid)
+    try { reg?.proc?.kill('SIGKILL') } catch { /* already gone */ }
+  },
+})
+
+// Restart recovery: interrupted caption tasks are requeued. Tasks stuck in
+// 'rendering' whose render survived the restart (pending.json → rehydrateRenders)
+// are re-attached to that render instead of duplicating FFmpeg work. Stages
+// whose output was lost (no surviving render, no provider cues) re-run from a
+// known-idempotent point; a task can never be marked completed by recovery.
+async function recoverCaptionTasks() {
+  let names
+  try { names = await fsp.readdir(JOBS) } catch { return }
+  for (const id of names) {
+    if (!/^[a-f0-9-]{16,64}$/.test(id)) continue
+    const tasks = await captionTasks.listRecoverable(id).catch(() => [])
+    for (const task of tasks) {
+      if (task.stage === 'rendering' && task.renderId && renders.get(task.renderId)) {
+        captionWorker.submit(task)
+        console.log(`[ai-studio] caption task ${id}/${task.taskId} re-attached to surviving render ${task.renderId}`)
+        continue
+      }
+      await captionTasks.recover(id, task.taskId, { stage: 'queued' })
+      const fresh = await captionTasks.get(id, task.taskId)
+      if (fresh) captionWorker.submit(fresh)
+      console.log(`[ai-studio] caption task ${id}/${task.taskId} recovered from "${task.stage}" → requeued`)
+    }
+  }
+}
+
 // --- captions: distribute pasted script lines over detected speech -----------
 // buildCues() / placeCues() (pure cue math) live in ai.js — unit-tested there.
 // speechSegments() stays here because it shells out to ffmpeg silencedetect.
@@ -833,6 +923,7 @@ const RATE_RULES = [
   { match: /^\/api\/chat$/, max: 12, windowMs: 60000 },
   { match: /^\/api\/upload$/, max: 5, windowMs: 10 * 60000 },
   { match: /^\/api\/captions$/, max: 8, windowMs: 60000 },
+  { match: /^\/api\/captions\/jobs$/, max: 30, windowMs: 60000 },
   { match: /^\/api\/strip$/, max: 40, windowMs: 60000 },
   { match: /^\/api\/jobs$/, max: 30, windowMs: 60000 },
 ]
@@ -948,6 +1039,7 @@ const server = http.createServer(async (req, res) => {
           concurrency: RENDER_CONCURRENCY,
           maxQueue: MAX_RENDER_QUEUE,
         },
+        captionTasks: captionWorker.stats(),
         // Capability flags let the Android client fail loudly instead of
         // silently dropping a setting this deployment does not support.
         capabilities: {
@@ -998,6 +1090,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- asynchronous automatic-caption tasks -----------------------------
+    // Submission is 202 + persisted task; the in-process worker does the work.
     const captionTaskMatch = p.match(/^\/api\/captions\/jobs\/([a-zA-Z0-9_-]{1,128})$/)
     if (p === '/api/captions/jobs' && req.method === 'POST') {
       const body = await readJson(req)
@@ -1012,7 +1105,40 @@ const server = http.createServer(async (req, res) => {
       if (meta.hasVideo === false) return json(res, 422, { error: { code: 'AUDIO_ONLY', message: 'Captions can only be burned into a video version.', retryable: false } })
       const idempotencyKey = String(req.headers['idempotency-key'] || body.idempotencyKey || '').trim()
       if (!idempotencyKey) return json(res, 400, { error: { code: 'IDEMPOTENCY_KEY_REQUIRED', message: 'Idempotency-Key is required.', retryable: false } })
-      const task = await captionTasks.create(id, { idempotencyKey, instructions: body.instructions })
+      // Caption layout + mode are resolved once at submission so the worker
+      // needs no LLM/layout context later and stays a pure pipeline.
+      const parsedInstructions = parseSubtitleInstructions(body.instructions)
+      const layout = resolveCaptionLayout({
+        instructions: body.instructions,
+        position: body.position,
+        style: body.style,
+        layer: body.layer,
+      }, meta)
+      const fieldMode = normalizeMode(body.mode)
+      const mode = parsedInstructions.explicitMode ? parsedInstructions.mode : (fieldMode || 'add')
+      const task = await captionTasks.create(id, {
+        idempotencyKey,
+        instructions: body.instructions,
+        options: {
+          srcName,
+          mode,
+          layout: {
+            position: layout.position,
+            style: layout.style,
+            maxChars: layout.maxChars,
+            maxLines: layout.maxLines,
+            layer: layout.layer,
+            alignment: layout.alignment,
+          },
+          meta: {
+            duration: meta.duration, width: meta.width, height: meta.height,
+            hasAudio: meta.hasAudio, hasVideo: meta.hasVideo, fps: meta.fps,
+          },
+        },
+      })
+      // Duplicate submissions with the same idempotency key return the same
+      // task; an already-queued/running task is not enqueued twice.
+      captionWorker.submit(task)
       return json(res, 202, task)
     }
     if (captionTaskMatch && (req.method === 'GET' || req.method === 'DELETE')) {
@@ -1020,9 +1146,15 @@ const server = http.createServer(async (req, res) => {
       const jobId = url.searchParams.get('id') || req.headers['x-job-id'] || ''
       if (!validJobId(jobId)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'A valid source job id is required.', retryable: false } })
       try {
-        const task = req.method === 'DELETE'
-          ? await captionTasks.cancel(jobId, taskId)
-          : await captionTasks.get(jobId, taskId)
+        if (req.method === 'DELETE') {
+          // Abort provider requests / FFmpeg work first, then persist cancel —
+          // a cancelled task can never advance to another stage afterwards.
+          captionWorker.cancel(taskId)
+          const task = await captionTasks.cancel(jobId, taskId)
+          if (!task) return json(res, 404, { error: { code: 'CAPTION_TASK_NOT_FOUND', message: 'Caption task not found.', retryable: true } })
+          return json(res, 200, task)
+        }
+        const task = await captionTasks.get(jobId, taskId)
         if (!task) return json(res, 404, { error: { code: 'CAPTION_TASK_NOT_FOUND', message: 'Caption task not found.', retryable: true } })
         return json(res, 200, task)
       } catch (e) {
@@ -1545,4 +1677,6 @@ server.listen(PORT, () => {
 })
 setInterval(cleanupJobs, 30 * 60 * 1000).unref()
 cleanupJobs()
-rehydrateRenders()
+// Render rehydration first: a caption task stuck in 'rendering' can only be
+// re-attached when its interrupted render is back in the registry.
+rehydrateRenders().then(recoverCaptionTasks).catch((e) => console.error('[ai-studio] caption recovery failed:', e))
