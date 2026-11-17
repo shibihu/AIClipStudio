@@ -57,6 +57,7 @@ const {
 } = require('./render-report')
 const { buildFfmpegArgs, displayCommand } = require('./render-args')
 const { buildCaptionRender } = require('./caption-render')
+const { CaptionTaskStore } = require('./caption-jobs')
 
 const ROOT = __dirname
 const PUBLIC = path.join(ROOT, 'public')
@@ -68,6 +69,7 @@ const BACKEND_VERSION = '1.1.0'
 const API_SCHEMA_VERSION = 2
 const UPLOAD_AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'aiff', 'aif', 'mpga'])
 const UPLOAD_VIDEO_EXT = new Set(['mp4', 'mov', 'webm', 'mkv', 'm4v', 'avi', 'gif'])
+const captionTasks = new CaptionTaskStore(JOBS)
 
 const CAPABILITIES = Object.freeze({
   androidSkills: true,
@@ -993,6 +995,39 @@ const server = http.createServer(async (req, res) => {
       }
       jobs.sort((a, b) => b.mtime - a.mtime)
       return json(res, 200, { jobs: jobs.slice(0, 60), llm: getLlmHealth() })
+    }
+
+    // ---- asynchronous automatic-caption tasks -----------------------------
+    const captionTaskMatch = p.match(/^\/api\/captions\/jobs\/([a-zA-Z0-9_-]{1,128})$/)
+    if (p === '/api/captions/jobs' && req.method === 'POST') {
+      const body = await readJson(req)
+      const { id } = body
+      if (!validJobId(id)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'Invalid job id.', retryable: false } })
+      const job = getJob(id)
+      if (!job) return json(res, 404, { error: { code: 'UNKNOWN_JOB', message: 'unknown job — upload a clip first', retryable: false } })
+      const srcName = job.versions[job.base]?.name
+      const src = path.join(JOBS, id, srcName || '')
+      const meta = await probe(src)
+      if (!meta.hasAudio) return json(res, 422, { error: { code: 'NO_AUDIO', message: 'This version has no audio track to transcribe.', retryable: false } })
+      if (meta.hasVideo === false) return json(res, 422, { error: { code: 'AUDIO_ONLY', message: 'Captions can only be burned into a video version.', retryable: false } })
+      const idempotencyKey = String(req.headers['idempotency-key'] || body.idempotencyKey || '').trim()
+      if (!idempotencyKey) return json(res, 400, { error: { code: 'IDEMPOTENCY_KEY_REQUIRED', message: 'Idempotency-Key is required.', retryable: false } })
+      const task = await captionTasks.create(id, { idempotencyKey, instructions: body.instructions })
+      return json(res, 202, task)
+    }
+    if (captionTaskMatch && (req.method === 'GET' || req.method === 'DELETE')) {
+      const taskId = captionTaskMatch[1]
+      const jobId = url.searchParams.get('id') || req.headers['x-job-id'] || ''
+      if (!validJobId(jobId)) return json(res, 400, { error: { code: 'BAD_JOB_ID', message: 'A valid source job id is required.', retryable: false } })
+      try {
+        const task = req.method === 'DELETE'
+          ? await captionTasks.cancel(jobId, taskId)
+          : await captionTasks.get(jobId, taskId)
+        if (!task) return json(res, 404, { error: { code: 'CAPTION_TASK_NOT_FOUND', message: 'Caption task not found.', retryable: true } })
+        return json(res, 200, task)
+      } catch (e) {
+        return json(res, 409, { error: { code: 'CAPTION_TASK_STATE', message: e.message, retryable: false } })
+      }
     }
 
     // ---- login (shared access token; only when AUTH_TOKEN is set) ----
